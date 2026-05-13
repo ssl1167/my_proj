@@ -1,0 +1,17 @@
+# 1. 首选官方 CUDA 源 (确保下载到 GPU 版本的 torch)
+--index-url https://download.pytorch.org/whl/cu124
+
+# 2. 备用清华镜像 (加速 numpy, pandas, qiskit 等其他包的下载)
+--extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 你的依赖包列表
+# 注意：在指定了上面的 index-url 后，直接写 torch>=2.0.0 也会自动匹配到 cu124 版本
+numpy>=1.21.0
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+qiskit>=0.45.0
+networkx>=3.0
+pandas>=1.5.0
+matplotlib>=3.5.0
+tqdm>=4.65.0
