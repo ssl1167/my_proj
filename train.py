@@ -90,9 +90,10 @@ def make_env(args: argparse.Namespace) -> InitialLayoutEnv:
     return InitialLayoutEnv(hardware, env_cfg, reward_cfg)
 
 
-def build_model_from_env(env: InitialLayoutEnv, sample_circuit, hidden_dim: int, graph_layers: int, dropout: float,
+def build_model_from_env(env: InitialLayoutEnv, sample, hidden_dim: int, graph_layers: int, dropout: float,
                          physical_prior_scale: float, physical_prior_clip: float, device: torch.device):
-    obs = env.reset(sample_circuit)
+    # 注入缓存
+    obs = env.reset(sample.to_circuit(), logic_graph=sample.get_logic_graph(env.env_cfg))
     logic_feat_dim = int(obs["logic_node_features"].shape[-1])
     phys_feat_dim = int(obs["physical_node_features"].shape[-1])
     candidate_feat_dim = int(obs["candidate_features_bank"].shape[-1])
@@ -115,8 +116,9 @@ def build_model_from_env(env: InitialLayoutEnv, sample_circuit, hidden_dim: int,
 
 
 @torch.no_grad()
-def run_eval_episode(model: GraphAwarePolicy, env: InitialLayoutEnv, circuit, device: torch.device):
-    obs = env.reset(circuit, is_training=False)
+def run_eval_episode(model: GraphAwarePolicy, env: InitialLayoutEnv, sample, device: torch.device):
+    # 使用注入缓存大幅加速验证集评估
+    obs = env.reset(sample.to_circuit(), is_training=False, logic_graph=sample.get_logic_graph(env.env_cfg))
     done = False
     total_reward = 0.0
     info: Dict = {}
@@ -158,7 +160,8 @@ def choose_eval_subset(samples: Sequence, eval_episodes: int, rng: np.random.Gen
 @torch.no_grad()
 def evaluate_policy(model: GraphAwarePolicy, env: InitialLayoutEnv, samples: Sequence, device: torch.device) -> Dict[str, Optional[float]]:
     model.eval()
-    rows = [run_eval_episode(model, env, sample.to_circuit(), device) for sample in samples]
+    # 原代码是 sample.to_circuit()，现改为直接传 sample
+    rows = [run_eval_episode(model, env, sample, device) for sample in samples]
     model.train()
     return aggregate_eval_rows(rows)
 
@@ -274,7 +277,7 @@ def run_training(args: argparse.Namespace) -> None:
     env = make_env(args)
     model, model_cfg = build_model_from_env(
         env,
-        train_samples[0].to_circuit(),
+        train_samples[0],  # 传 sample 对象过去，而不是单纯传 circuit
         args.hidden_dim,
         args.graph_layers,
         args.dropout,
@@ -360,7 +363,8 @@ def run_training(args: argparse.Namespace) -> None:
             iterator = stage_episode_iterator(stage_train, args.episodes_per_epoch, args.family_balance_mode, stage_rng)
             pbar = tqdm(iterator, total=args.episodes_per_epoch, desc=f"stage={stage_qubits} epoch={epoch}")
             for sample in pbar:
-                obs = env.reset(sample.to_circuit(), is_training=True)
+                # --- 核心修改 4：在最核心、调用频次最高的循环里，挂载 O(1) 复杂度的缓存图 ---
+                obs = env.reset(sample.to_circuit(), is_training=True, logic_graph=sample.get_logic_graph(env.env_cfg))
                 done = False
                 traj = TrajectoryBuffer()
                 total_reward = 0.0
