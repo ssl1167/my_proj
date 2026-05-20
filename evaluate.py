@@ -391,9 +391,9 @@ if __name__ == "__main__":
             "initial_mapper",
             "mode",
             "swap_count",
-            "original_gate_count_all",
-            "additional_gates_total",
-            "additional_swap_count",
+            "original_cnot_count_all",
+            "routed_cnot_equiv_count",
+            "additional_cnot_equiv_from_swap",
             "routing_time_sec",
             "evaluating_router",
         ]
@@ -402,9 +402,9 @@ if __name__ == "__main__":
 
     print(df.groupby("family")[[
         "swap_count",
-        "original_gate_count_all",
-        "additional_gates_total",
-        "additional_swap_count",
+        "original_cnot_count_all",
+        "routed_cnot_equiv_count",
+        "additional_cnot_equiv_from_swap",
         "routing_time_sec",
     ]].mean(numeric_only=True))
     print(f"Saved full metrics to {out}")
