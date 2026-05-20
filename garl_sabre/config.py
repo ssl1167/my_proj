@@ -58,23 +58,25 @@ class EnvConfig:
     use_physical_prior: bool = True
 
     sabre_seed: int = 7
-    optimization_level: int = 0
+    optimization_level: int = 1  # 推荐设为1，以便在路由时激活基础级联优化
     basis_gates: List[str] = field(default_factory=lambda: ["cx", "id", "rz", "sx", "x"])
     topology_mode: str = "heavy_hex"
     topology_distance: int = 5
 
     action_mode: str = "hierarchical"
     logic_order_mode: str = "priority_fixed"
-    baseline_mode: str = "dense"
+    
+    # --- 学术级扩充 ---
+    # baseline_mode 可选: "dense", "trivial", "sabre" (绝对锁死单一标杆，彻底废弃不合规的 hybrid)
+    baseline_mode: str = "sabre" 
 
     evaluation_mode: str = "legacy"
+    
+    # router_backend 可选: "qiskit" (运行 SabreRouting), "tket" (运行 Pytket Routing)
     router_backend: str = "qiskit"
 
     # Legacy field retained for compatibility with older scripts/checkpoints.
     paper_two_qubit_only: bool = True
-
-    routing_backend: str = "sabre"  # 可选控制流: "sabre" 或 "tket"
-    baseline_mode: str = "hybrid"   # 建议扩充基线模式
 
     @classmethod
     def strong(cls) -> "EnvConfig":
