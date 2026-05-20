@@ -92,10 +92,15 @@ def make_env(args: argparse.Namespace) -> InitialLayoutEnv:
 
 def build_model_from_env(env: InitialLayoutEnv, sample, hidden_dim: int, graph_layers: int, dropout: float,
                          physical_prior_scale: float, physical_prior_clip: float, device: torch.device):
-    # 注入缓存
-    obs = env.reset(sample.to_circuit(), logic_graph=sample.get_logic_graph(env.env_cfg))
+# 注入并同步基线缓存
+    if sample._cached_baseline is None:
+        obs = env.reset(sample.to_circuit(), logic_graph=sample.get_logic_graph(env.env_cfg))
+        sample._cached_baseline = (env.baseline_score, env.baseline_name, env.baseline_metrics)
+    else:
+        obs = env.reset(sample.to_circuit(), logic_graph=sample.get_logic_graph(env.env_cfg), baseline_info=sample._cached_baseline)
+
     logic_feat_dim = int(obs["logic_node_features"].shape[-1])
-    phys_feat_dim = int(obs["physical_node_features"].shape[-1])
+
     candidate_feat_dim = int(obs["candidate_features_bank"].shape[-1])
     logical_candidate_feat_dim = int(obs["logical_candidate_features"].shape[-1])
     cfg = ModelConfig(
