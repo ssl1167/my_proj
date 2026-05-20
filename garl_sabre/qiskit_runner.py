@@ -42,13 +42,13 @@ def prepare_basis_circuit(circuit: QuantumCircuit, env_cfg: EnvConfig | None = N
     prepared = transpile(
         circuit,
         basis_gates=env_cfg.basis_gates,
-        optimization_level=0,
+        optimization_level=env_cfg.optimization_level,
         seed_transpiler=env_cfg.sabre_seed,
     )
     new_metadata = dict(prepared.metadata or {})
     new_metadata[_PREPARED_FLAG] = True
     new_metadata[_PREPARED_BASIS] = list(basis_tag)
-    new_metadata[_PREPARED_OPT] = 0
+    new_metadata[_PREPARED_OPT] = env_cfg.optimization_level
     prepared.metadata = new_metadata
     return prepared
 
