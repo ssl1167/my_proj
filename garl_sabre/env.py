@@ -569,20 +569,17 @@ class InitialLayoutEnv:
 
         if done:
             layout = self.mapping_log_to_phys.tolist()
-            metrics = evaluate_layout_metrics(self.circuit, layout, self.hardware, self.env_cfg)
-            rl_score = objective_from_metrics(metrics, self.reward_cfg, self.env_cfg)
+            
+            # --- 核心修改：动态对齐路由后端评估流 ---
+            backend_mode = getattr(self.env_cfg, "routing_backend", "sabre")
+            metrics = route_with_backend(self.circuit, layout, self.hardware, backend_name=backend_mode)
+            
+            # 利用上一轮我们重构的高鲁棒相对基线公式计算奖励
+            rl_score = metrics["cnot_count"]  # 以 CNOT 数量作为直接优化目标
             terminal_objective = float(rl_score)
             
-            # --- 核心修改：对齐基线锚定 + 线路规模动态自适应缩放 ---
-            # 计算 RL 相对基线的提升比例 (Baseline 越小越好，即优化目标是最小化 score)
-            # 若 RL Score < Anchor Score，说明超越基线，relative_improvement 为正值
             relative_improvement = (self.reward_anchor_score - terminal_objective) / self.reward_anchor_score
-            
-            # 使用 ln(N) 对线路规模进行软缩放，使 20 比特和 100 比特线路的最终终端奖励期望保持在同一水平线
             num_qubits_factor = np.log(max(float(self.logic.num_qubits), 2.0))
-            
-            # 此时系统的 terminal_scale 具有明确的物理意义：
-            # 它代表“当 RL 取得 100% 满分优化红利且在线路规模增长时的最大单位奖励放大系数值”
             terminal_reward = float(self.reward_cfg.terminal_scale * relative_improvement * num_qubits_factor)
             
             reward += float(terminal_reward)
