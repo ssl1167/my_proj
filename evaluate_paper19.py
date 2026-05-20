@@ -165,12 +165,12 @@ def generate_comparison_table(df: pd.DataFrame, output_path: Path):
     print(f"实际评测的方法: {df['method'].unique()}")
     value_cols = [
         "swap_count",
-        "original_gate_count_all",
-        "additional_gates_total",
+        "original_cnot_count_all",
+        "routed_cnot_equiv_count",
+        "routed_cnot_raw_count",
+        "additional_cnot_equiv_from_swap",
         "additional_swap_count",
         "routing_time_sec",
-        "routed_cnot_equiv_count",
-        "routed_gate_count_all",
         "depth_overhead",
     ]
     existing_value_cols = [c for c in value_cols if c in df.columns]
@@ -199,13 +199,13 @@ def generate_comparison_table(df: pd.DataFrame, output_path: Path):
     agg_dict = {}
     for col in [
         "swap_count",
-        "original_gate_count_all",
-        "additional_gates_total",
+        "original_cnot_count_all",
+        "routed_cnot_equiv_count",
+        "routed_cnot_raw_count",
+        "additional_cnot_equiv_from_swap",
         "additional_swap_count",
         "routing_score",
         "routing_time_sec",
-        "routed_cnot_equiv_count",
-        "routed_gate_count_all",
         "depth_overhead",
     ]:
         if col in df.columns:
@@ -215,7 +215,7 @@ def generate_comparison_table(df: pd.DataFrame, output_path: Path):
 
     if rl_method in df["method"].unique():
         print("\n=== 按 family 汇总 (RL+beam+tabu) ===")
-        family_cols = [c for c in ["swap_count", "original_gate_count_all", "additional_gates_total", "additional_swap_count", "depth_overhead"] if c in df.columns]
+        family_cols = [c for c in ["swap_count", "original_cnot_count_all", "routed_cnot_equiv_count", "additional_cnot_equiv_from_swap", "depth_overhead"] if c in df.columns]
         if family_cols:
             print(df[df["method"] == rl_method].groupby("family")[family_cols].agg(["mean", "std"]).round(2))
 
@@ -289,8 +289,10 @@ def main():
         "name",
         "method",
         "swap_count",
-        "original_gate_count_all",
-        "additional_gates_total",
+        "original_cnot_count_all",
+        "routed_cnot_equiv_count",
+        "routed_cnot_raw_count",
+        "additional_cnot_equiv_from_swap",
         "additional_swap_count",
         "routing_time_sec",
     ]].to_csv(paper_table_path, index=False)
