@@ -42,11 +42,17 @@ def _layerize_two_qubit_ops(circuit: QuantumCircuit) -> List[List[Tuple[int, int
     
     # 2. 仅过滤保留具有拓扑约束的双量子比特操作，彻底解耦单比特门干扰
     for inst in circuit.data:
-        # 终极全版本兼容解析：安全剥离算子、量子比特位与经典比特位
-        op = getattr(inst, "operation", inst[0])
-
-        qargs = getattr(inst, "qubits", inst[1])
-        cargs = getattr(inst, "clbits", inst[2] if len(inst) > 2 else [])
+        # 终极全版本兼容解析：阻断渴求求值陷阱，安全剥离算子与比特位
+        if hasattr(inst, "operation"):
+            # Qiskit 1.0+ 标准 CircuitInstruction 对象结构
+            op = inst.operation
+            qargs = inst.qubits
+            cargs = inst.clbits
+        else:
+            # Qiskit 0.x 传统 Tuple 结构
+            op = inst[0]
+            qargs = inst[1]
+            cargs = inst[2] if len(inst) > 2 else []
 
         if len(qargs) == 2:
             two_q_circ.append(op, qargs=qargs, cargs=cargs)
