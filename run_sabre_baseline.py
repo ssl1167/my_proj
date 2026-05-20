@@ -131,11 +131,10 @@ def main() -> None:
 
     summary_cols = [
         "swap_count",
-        "additional_gates_total",
-        "additional_swap_count",
+        "additional_cnot_equiv_from_swap",
         "routed_cnot_equiv_count",
         "routing_time_sec",
-        "original_gate_count_all",
+        "original_cnot_count_all",
     ]
     print(df.groupby(["method", "family"])[summary_cols].mean(numeric_only=True))
     print(f"Saved to {out}")
