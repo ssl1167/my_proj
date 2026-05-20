@@ -5,7 +5,7 @@ import math
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from qiskit import QuantumCircuit
 from qiskit.circuit.library import QAOAAnsatz, TwoLocal, QFT
@@ -25,6 +25,8 @@ class CircuitSample:
     
     # --- 核心修改 1：增加逻辑图特征的惰性缓存字段 ---
     _cached_logic_graph: LogicGraphData | None = field(default=None, init=False, repr=False, compare=False)
+    # --- 追加基线分母缓存 ---
+    _cached_baseline: Tuple[Optional[float], str, Dict[str, float]] | None = field(default=None, init=False, repr=False, compare=False)
 
     def to_circuit(self) -> QuantumCircuit:
         if self._cached_circuit is None:
