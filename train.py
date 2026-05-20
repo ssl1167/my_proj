@@ -117,8 +117,12 @@ def build_model_from_env(env: InitialLayoutEnv, sample, hidden_dim: int, graph_l
 
 @torch.no_grad()
 def run_eval_episode(model: GraphAwarePolicy, env: InitialLayoutEnv, sample, device: torch.device):
-    # 使用注入缓存大幅加速验证集评估
-    obs = env.reset(sample.to_circuit(), is_training=False, logic_graph=sample.get_logic_graph(env.env_cfg))
+    # 确保基线已计算，并传入
+    if sample._cached_baseline is None:
+        obs = env.reset(sample.to_circuit(), is_training=False, logic_graph=sample.get_logic_graph(env.env_cfg))
+        sample._cached_baseline = (env.baseline_score, env.baseline_name, env.baseline_metrics)
+    else:
+        obs = env.reset(sample.to_circuit(), is_training=False, logic_graph=sample.get_logic_graph(env.env_cfg), baseline_info=sample._cached_baseline)
     done = False
     total_reward = 0.0
     info: Dict = {}
@@ -364,7 +368,11 @@ def run_training(args: argparse.Namespace) -> None:
             pbar = tqdm(iterator, total=args.episodes_per_epoch, desc=f"stage={stage_qubits} epoch={epoch}")
             for sample in pbar:
                 # --- 核心修改 4：在最核心、调用频次最高的循环里，挂载 O(1) 复杂度的缓存图 ---
-                obs = env.reset(sample.to_circuit(), is_training=True, logic_graph=sample.get_logic_graph(env.env_cfg))
+                if sample._cached_baseline is None:
+                    obs = env.reset(sample.to_circuit(), is_training=True, logic_graph=sample.get_logic_graph(env.env_cfg))
+                    sample._cached_baseline = (env.baseline_score, env.baseline_name, env.baseline_metrics)
+                else:
+                    obs = env.reset(sample.to_circuit(), is_training=True, logic_graph=sample.get_logic_graph(env.env_cfg), baseline_info=sample._cached_baseline)
                 done = False
                 traj = TrajectoryBuffer()
                 total_reward = 0.0
