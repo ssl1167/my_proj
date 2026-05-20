@@ -73,6 +73,9 @@ class EnvConfig:
     # Legacy field retained for compatibility with older scripts/checkpoints.
     paper_two_qubit_only: bool = True
 
+    routing_backend: str = "sabre"  # 可选控制流: "sabre" 或 "tket"
+    baseline_mode: str = "hybrid"   # 建议扩充基线模式
+
     @classmethod
     def strong(cls) -> "EnvConfig":
         return cls(candidate_topk=20)
@@ -143,3 +146,4 @@ class PPOConfig:
     minibatch_size: int = 16
     value_clip: float = 0.2
     target_kl: float = 0.08
+    
