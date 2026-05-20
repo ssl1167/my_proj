@@ -120,8 +120,8 @@ class InitialLayoutEnv:
         deg = np.maximum(adj.sum(axis=1, keepdims=True), 1e-8)
         return (adj / deg).astype(np.float32)
 
-    # 修改 reset 方法签名，追加 logic_graph 参数
-    def reset(self, circuit: QuantumCircuit, is_training: Optional[bool] = None, logic_graph: Optional[LogicGraphData] = None) -> Dict:
+    # 扩大参数签名，接收外部缓存的 baseline_info
+    def reset(self, circuit: QuantumCircuit, is_training: Optional[bool] = None, logic_graph: Optional[LogicGraphData] = None, baseline_info: Optional[Tuple] = None) -> Dict:
         if circuit.num_qubits > self.hardware.num_qubits:
             raise ValueError(f"Circuit has {circuit.num_qubits} qubits, but hardware only has {self.hardware.num_qubits}.")
 
@@ -146,7 +146,11 @@ class InitialLayoutEnv:
         self.critical_pair_mask = self._pairs_to_mask(self.logic.critical_edges)
         
         # ==================== 核心修改 2: 锁死单一公认外部标杆，斩断 hybrid 漏洞 ====================
-        self.baseline_score, self.baseline_name, self.baseline_metrics = self._compute_baseline()
+        # ==================== 核心修改：短路基线计算 ====================
+        if baseline_info is not None:
+            self.baseline_score, self.baseline_name, self.baseline_metrics = baseline_info
+        else:
+            self.baseline_score, self.baseline_name, self.baseline_metrics = self._compute_baseline()
         
         # 强制将奖励函数的反事实参照物分母与你指定的单一 baseline_mode 深度锁死
         self.reward_anchor_score = self.baseline_score if self.baseline_score is not None else 1.0
@@ -653,10 +657,9 @@ class InitialLayoutEnv:
             # 计算当前 RL 结果相比固定外部基线的相对优化提升红利率
             relative_improvement = (self.reward_anchor_score - terminal_objective) / self.reward_anchor_score
             
-            # 使用对数缩放因子抵消不同规模量子线路的步长总回报累积方差
-            num_qubits_factor = np.log(max(float(self.logic.num_qubits), 2.0))
-            
-            # 最终的具有清晰物理含义的大奖励
+            # 使用线性缩放实现绝对的 MDP 价值对齐，拒绝 Reward Hacking 
+            num_qubits_factor = float(self.logic.num_qubits)  
+
             terminal_reward = float(self.reward_cfg.terminal_scale * relative_improvement * num_qubits_factor)
             reward += float(terminal_reward)
             # =========================================================================================
