@@ -116,7 +116,7 @@ def build_model_from_env(env: InitialLayoutEnv, sample_circuit, hidden_dim: int,
 
 @torch.no_grad()
 def run_eval_episode(model: GraphAwarePolicy, env: InitialLayoutEnv, circuit, device: torch.device):
-    obs = env.reset(circuit)
+    obs = env.reset(circuit, is_training=False)
     done = False
     total_reward = 0.0
     info: Dict = {}
@@ -360,7 +360,7 @@ def run_training(args: argparse.Namespace) -> None:
             iterator = stage_episode_iterator(stage_train, args.episodes_per_epoch, args.family_balance_mode, stage_rng)
             pbar = tqdm(iterator, total=args.episodes_per_epoch, desc=f"stage={stage_qubits} epoch={epoch}")
             for sample in pbar:
-                obs = env.reset(sample.to_circuit())
+                obs = env.reset(sample.to_circuit(), is_training=True)
                 done = False
                 traj = TrajectoryBuffer()
                 total_reward = 0.0
