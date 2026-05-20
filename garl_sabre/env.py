@@ -4,13 +4,23 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
-from qiskit import QuantumCircuit
+from qiskit import QuantumCircuit, transpile
 
 from .circuit_features import LogicGraphData, build_logic_graph
 from .config import EnvConfig, RewardConfig
 from .heuristics import dense_layout, trivial_layout
 from .qiskit_runner import evaluate_layout_metrics, objective_from_metrics
 from .topology import HardwareTopology, adjacency_with_self_loops
+
+# 学术级级联惰性导入：动态探测环境中是否安有 Quantinuum t|ket> 编译生态
+try:
+    from pytket.extensions.qiskit import qiskit_to_tk, tk_to_qiskit
+    from pytket.architecture import Architecture
+    from pytket.passes import RoutingPass
+    from pytket.circuit import Node
+    HAS_TKET = True
+except ImportError:
+    HAS_TKET = False
 
 
 @dataclass
@@ -22,7 +32,7 @@ class StepOutput:
 
 
 class InitialLayoutEnv:
-    """Hierarchical initial-layout environment with light step shaping and swap-only terminal objective."""
+    """高级量子初始映射强化学习环境：融合自适应图熵权、双路由后端评测与可控外部标杆锚定。"""
 
     def __init__(self, hardware: HardwareTopology, env_cfg: EnvConfig | None = None, reward_cfg: RewardConfig | None = None) -> None:
         self.hardware = hardware
@@ -40,35 +50,24 @@ class InitialLayoutEnv:
 
         finite_d = self.hardware.dist[self.hardware.dist < 1e8]
         self.max_dist = float(max(1.0, finite_d.max() if finite_d.size > 0 else 1.0))
-        # --- 工业级最优方案：拓扑自适应信息论熵权融合引擎 ---
-        raw_topo_feats = self.hardware.node_features[:, :4].astype(np.float32)  # 提取前4个拓扑图论特征
+
+        # ==================== 核心修改 1: 拓扑自适应图论熵权融合引擎 ====================
+        raw_topo_feats = self.hardware.node_features[:, :4].astype(np.float32)
         num_nodes = raw_topo_feats.shape[0]
-
         if num_nodes > 1:
-            # 1. 列归一化：将特征矩阵转化为概率分布矩阵 P
             col_sums = np.sum(raw_topo_feats, axis=0, keepdims=True)
-            col_sums = np.where(col_sums == 0, 1e-8, col_sums)  # 规避全零特征列导致的除零异常
+            col_sums = np.where(col_sums == 0, 1e-8, col_sums)
             p_matrix = raw_topo_feats / col_sums
-
-            # 2. 计算各特征列的信息熵 (Information Entropy)
-            # 引入 1e-12 级微小位移，杜绝 p=0 时 np.log 产生的 NaN 破坏整个系统梯度流
             eps = 1e-12
             entropy = -np.sum(p_matrix * np.log(p_matrix + eps), axis=0) / np.log(num_nodes)
-
-            # 3. 计算信息效用值 (Information Utility) 与自适应权重
             utility = 1.0 - entropy
             utility_sum = np.sum(utility)
-            
-            if utility_sum > 1e-6:
-                entropy_weights = utility / utility_sum
-            else:
-                # 若拓扑特征极度均匀（如无限对称图），则退化为均匀分布，保证数值基线稳定
-                entropy_weights = np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float32)
+            entropy_weights = utility / utility_sum if utility_sum > 1e-6 else np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float32)
         else:
             entropy_weights = np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float32)
-
-        # 4. 通过矩阵内积实现高分辨率的中心性表征向量
+        
         self.phys_centrality = np.dot(raw_topo_feats, entropy_weights).astype(np.float32)
+        # ==============================================================================
 
         self.physical_adj_binary: np.ndarray = adjacency_with_self_loops(self.hardware.graph, self.hardware.num_qubits)
         self.physical_adj: np.ndarray = self._build_physical_weighted_adj()
@@ -76,6 +75,7 @@ class InitialLayoutEnv:
         self.baseline_score: Optional[float] = None
         self.baseline_name: str = "none"
         self.baseline_metrics: Dict[str, float] = {}
+        self.reward_anchor_score: float = 1.0
 
     def _use_candidate_ranking(self) -> bool:
         return bool(getattr(self.env_cfg, "use_candidate_ranking", True))
@@ -84,7 +84,7 @@ class InitialLayoutEnv:
         return bool(getattr(self.env_cfg, "use_physical_prior", True))
 
     def _compute_baseline_metrics(self) -> bool:
-        return bool(getattr(self.env_cfg, "compute_baseline_metrics", False))
+        return True  # 学术级评测流中强制激活基线计算
 
     def _build_physical_weighted_adj(self) -> np.ndarray:
         n = self.hardware.num_qubits
@@ -125,23 +125,18 @@ class InitialLayoutEnv:
         self.logical_order = self._build_logical_order()
         self.front_pair_mask = self._pairs_to_mask(self.logic.front_pairs)
         self.critical_pair_mask = self._pairs_to_mask(self.logic.critical_edges)
-        # 处理用户自定义的 Baseline 指标记录
-        if self._compute_baseline_metrics():
-            self.baseline_score, self.baseline_name, self.baseline_metrics = self._compute_baseline()
-        else:
-            self.baseline_score, self.baseline_name, self.baseline_metrics = None, "none", {}
         
-        # --- 核心修改：工业级鲁棒奖励锚定机制 ---
-        # 无论系统是否记录 baseline 监控指标，内部必须强制生成一个客观分母，以杜绝奖励爆炸
-        self.reward_anchor_score = self.baseline_score
-        if self.reward_anchor_score is None:
-            # 采用低成本高鲁棒性的 dense_layout 作为内部隐式数学锚点
+        # ==================== 核心修改 2: 锁死单一公认外部标杆，斩断 hybrid 漏洞 ====================
+        self.baseline_score, self.baseline_name, self.baseline_metrics = self._compute_baseline()
+        
+        # 强制将奖励函数的反事实参照物分母与你指定的单一 baseline_mode 深度锁死
+        self.reward_anchor_score = self.baseline_score if self.baseline_score is not None else 1.0
+        if self.reward_anchor_score <= 1e-5:
+            # 如果极端线路算出来的 CNOT 开销为 0，用低开销 dense 方案进行保底，规避除零异常
             fast_layout = dense_layout(self.logic, self.hardware)
-            fast_metrics = evaluate_layout_metrics(self.circuit, fast_layout, self.hardware, self.env_cfg)
-            self.reward_anchor_score = float(objective_from_metrics(fast_metrics, self.reward_cfg, self.env_cfg))
-        
-        # 防止极端小型拓扑下 baseline 计算出 0 导致后续除以 0 异常
-        self.reward_anchor_score = max(float(self.reward_anchor_score), 1e-5)
+            metrics = evaluate_layout_metrics(self.circuit, fast_layout, self.hardware, self.env_cfg)
+            self.reward_anchor_score = max(float(objective_from_metrics(metrics, self.reward_cfg, self.env_cfg)), 1.0)
+        # =========================================================================================
 
         return self._get_obs()
 
@@ -461,15 +456,15 @@ class InitialLayoutEnv:
             centered = float((cand["score_raw"] - score_mean) / norm)
             best_gap = float((cand["score_raw"] - float(np.max(scores))) / norm)
 
-        raw_shaping = 0.0
-        raw_shaping += 0.10 * centered
-        raw_shaping += 0.06 * best_gap
-        raw_shaping += 0.05 * cand["executable_frontier_ratio"]
-        raw_shaping += 0.03 * cand["free_neighbor_ratio"]
+        reward = 0.0
+        reward += 0.10 * centered
+        reward += 0.06 * best_gap
+        reward += 0.05 * cand["executable_frontier_ratio"]
+        reward += 0.03 * cand["free_neighbor_ratio"]
         
-        # --- 核心修改：非线性平滑压缩，消除硬裁剪引起的梯度断流 ---
-        # 既保证单步奖励绝不超越目标域 [-0.35, 0.35]，又保证全域可微
-        reward = float(0.35 * np.tanh(raw_shaping / 0.25))
+        # ==================== 核心修改 3: 双曲正切平滑激活，替换硬裁剪 ====================
+        reward = float(0.35 * np.tanh(reward / 0.25))
+        # ==============================================================================
 
         info = {
             "shape_base": -cand["base_dist"],
@@ -491,15 +486,35 @@ class InitialLayoutEnv:
         return reward, info
 
     def _compute_baseline(self) -> tuple[Optional[float], str, Dict[str, float]]:
+        """最高学术水准的基线评测黑盒：支持标准的 Sabre 初始映射。"""
         assert self.circuit is not None and self.logic is not None
         mode = self.env_cfg.baseline_mode
         if mode == "none":
             return None, "none", {}
 
+        # 1. 锁死工业黄金基线 Qiskit-Sabre 分数
+        if mode == "sabre":
+            # 激活 Qiskit 官方一揽子 Sabre 映射编译，使用环境指定的随机种子
+            sabre_routed_circ = transpile(
+                self.circuit,
+                coupling_map=self.hardware.coupling_map,
+                layout_method="sabre",
+                routing_method="sabre",
+                optimization_level=0,  # 0阶保证物理映射质量剥离，不涉及逻辑门重组
+                seed_transpiler=self.env_cfg.sabre_seed
+            )
+            sabre_metrics = {
+                "cnot_count": float(sabre_routed_circ.count_ops().get("cx", 0)),
+                "depth": float(sabre_routed_circ.depth())
+            }
+            sabre_score = float(sabre_metrics["cnot_count"])
+            return sabre_score, "sabre", sabre_metrics
+
+        # 2. 保留原有的常规紧凑和微弱基线分支（仅限非sabre状态）
         candidates: list[tuple[str, list[int]]] = []
-        if mode in {"trivial", "hybrid"}:
+        if mode == "trivial":
             candidates.append(("trivial", trivial_layout(self.logic.num_qubits)))
-        if mode in {"dense", "hybrid"}:
+        if mode == "dense":
             candidates.append(("dense", dense_layout(self.logic, self.hardware)))
 
         best_name = "none"
@@ -526,6 +541,57 @@ class InitialLayoutEnv:
             raise ValueError("Hierarchical mode expects action=(logical_q, physical_q).")
         return int(action[0]), int(action[1])
 
+    def _execute_dual_backend_routing(self, layout: list[int]) -> Dict[str, float]:
+        """核心路由模块：无缝解耦支持 Qiskit-Sabre 或 Quantinuum-tket 路由流。"""
+        backend = self.env_cfg.router_backend
+        
+        if backend == "qiskit":
+            # 锁死由强化学习环境层演进出的布局映射，禁止后续路由算法擅自更改 Initial Layout
+            initial_layout_dict = {self.circuit.qubits[i]: layout[i] for i in range(len(layout))}
+            routed_circ = transpile(
+                self.circuit,
+                coupling_map=self.hardware.coupling_map,
+                initial_layout=initial_layout_dict,
+                layout_method=None,  # 强行锁死，阻止 Qiskit 乱动初始位置
+                routing_method="sabre",
+                optimization_level=0,
+                seed_transpiler=self.env_cfg.sabre_seed
+            )
+            return {
+                "cnot_count": float(routed_circ.count_ops().get("cx", 0)),
+                "depth": float(routed_circ.depth())
+            }
+            
+        elif backend == "tket":
+            if not HAS_TKET:
+                raise ImportError("未探测到 pytket 生态，请执行 `pip install pytket pytket-qiskit`。")
+            
+            # 将 Qiskit 线路骨架平滑序列化至 pytket 核心图表征
+            tk_circ = qiskit_to_tk(self.circuit)
+            edges = [(int(u), int(v)) for u, v in self.hardware.coupling_map.get_edges()]
+            tk_architecture = Architecture(edges)
+            
+            # 将强化学习网络生成的布局锁死到 tket 节点双射映射字典上
+            placement_map = {}
+            for logical_idx, phys_idx in enumerate(layout):
+                if logical_idx < len(tk_circ.qubits):
+                    placement_map[tk_circ.qubits[logical_idx]] = Node(phys_idx)
+            
+            tk_circ.with_placement_map(placement_map)
+            
+            # 调用 tket 核心正统图结构并发交换路由 Pass
+            routing_pass = RoutingPass(tk_architecture)
+            routing_pass.apply(tk_circ)
+            
+            # 重新安全回写为 Qiskit 线路格式以保持全局统计口径绝对对齐
+            routed_circ_qiskit = tk_to_qiskit(tk_circ)
+            return {
+                "cnot_count": float(routed_circ_qiskit.count_ops().get("cx", 0)),
+                "depth": float(routed_circ_qiskit.depth())
+            }
+        else:
+            raise ValueError(f"不受支持的路由后端: {backend}")
+
     def step(self, action: int | Sequence[int] | np.ndarray) -> StepOutput:
         assert self.logic is not None and self.mapping_log_to_phys is not None and self.used_phys is not None and self.circuit is not None
 
@@ -533,25 +599,12 @@ class InitialLayoutEnv:
         logical_mask = self.logical_action_mask()
         if logical_q < 0 or logical_q >= logical_mask.size or logical_mask[logical_q] <= 0:
             valid = np.where(logical_mask > 0)[0].tolist()
-            raise ValueError(
-                "Illegal logical action "
-                f"{logical_q}. Valid logical indices: {valid}. "
-                f"step_idx={self.step_idx}, current_logical={self.current_logical_qubit()}, "
-                f"candidate_topk={self.env_cfg.candidate_topk}, "
-                f"use_candidate_ranking={self._use_candidate_ranking()}"
-            )
+            raise ValueError(f"Illegal logical action {logical_q}.")
 
         physical_mask = self._ranked_physical_mask(logical_q)
         if action_phys < 0 or action_phys >= physical_mask.size or physical_mask[action_phys] <= 0 or self.used_phys[action_phys] >= 0.5:
             valid = np.where(physical_mask > 0)[0].tolist()
-            raise ValueError(
-                "Illegal physical action "
-                f"{action_phys}. Valid physical indices: {valid}. "
-                f"step_idx={self.step_idx}, selected_logical={logical_q}, "
-                f"current_logical={self.current_logical_qubit()}, "
-                f"candidate_topk={self.env_cfg.candidate_topk}, "
-                f"use_candidate_ranking={self._use_candidate_ranking()}"
-            )
+            raise ValueError(f"Illegal physical action {action_phys}.")
 
         shape_reward, shape_info = self._shape_reward_for_choice(logical_q, action_phys)
         self.mapping_log_to_phys[logical_q] = action_phys
@@ -570,25 +623,24 @@ class InitialLayoutEnv:
         if done:
             layout = self.mapping_log_to_phys.tolist()
             
-            # --- 核心修改：动态对齐路由后端评估流 ---
-            backend_mode = getattr(self.env_cfg, "routing_backend", "sabre")
-            metrics = route_with_backend(self.circuit, layout, self.hardware, backend_name=backend_mode)
+            # ==================== 核心修改 4: 激活双后端动态自适应终结回报对齐公式 ====================
+            metrics = self._execute_dual_backend_routing(layout)
+            terminal_objective = float(metrics["cnot_count"])
             
-            # 利用上一轮我们重构的高鲁棒相对基线公式计算奖励
-            rl_score = metrics["cnot_count"]  # 以 CNOT 数量作为直接优化目标
-            terminal_objective = float(rl_score)
-            
+            # 计算当前 RL 结果相比固定外部基线的相对优化提升红利率
             relative_improvement = (self.reward_anchor_score - terminal_objective) / self.reward_anchor_score
-            num_qubits_factor = np.log(max(float(self.logic.num_qubits), 2.0))
-            terminal_reward = float(self.reward_cfg.terminal_scale * relative_improvement * num_qubits_factor)
             
+            # 使用对数缩放因子抵消不同规模量子线路的步长总回报累积方差
+            num_qubits_factor = np.log(max(float(self.logic.num_qubits), 2.0))
+            
+            # 最终的具有清晰物理含义的大奖励
+            terminal_reward = float(self.reward_cfg.terminal_scale * relative_improvement * num_qubits_factor)
             reward += float(terminal_reward)
+            # =========================================================================================
 
             info.update(metrics)
-            info["routing_score"] = float(rl_score)
+            info["routing_score"] = float(terminal_objective)
             info["baseline_score"] = float(self.baseline_score) if self.baseline_score is not None else None
-            info["reward_anchor_score"] = float(self.reward_anchor_score)
-            info["relative_improvement"] = float(relative_improvement)
             info["terminal_objective"] = float(terminal_objective)
             info["final_layout"] = layout
             info["terminal_reward"] = float(terminal_reward)
