@@ -40,12 +40,35 @@ class InitialLayoutEnv:
 
         finite_d = self.hardware.dist[self.hardware.dist < 1e8]
         self.max_dist = float(max(1.0, finite_d.max() if finite_d.size > 0 else 1.0))
-        self.phys_centrality = (
-            self.hardware.node_features[:, 0]
-            + self.hardware.node_features[:, 1]
-            + self.hardware.node_features[:, 2]
-            + self.hardware.node_features[:, 3]
-        ).astype(np.float32)
+        # --- 工业级最优方案：拓扑自适应信息论熵权融合引擎 ---
+        raw_topo_feats = self.hardware.node_features[:, :4].astype(np.float32)  # 提取前4个拓扑图论特征
+        num_nodes = raw_topo_feats.shape[0]
+
+        if num_nodes > 1:
+            # 1. 列归一化：将特征矩阵转化为概率分布矩阵 P
+            col_sums = np.sum(raw_topo_feats, axis=0, keepdims=True)
+            col_sums = np.where(col_sums == 0, 1e-8, col_sums)  # 规避全零特征列导致的除零异常
+            p_matrix = raw_topo_feats / col_sums
+
+            # 2. 计算各特征列的信息熵 (Information Entropy)
+            # 引入 1e-12 级微小位移，杜绝 p=0 时 np.log 产生的 NaN 破坏整个系统梯度流
+            eps = 1e-12
+            entropy = -np.sum(p_matrix * np.log(p_matrix + eps), axis=0) / np.log(num_nodes)
+
+            # 3. 计算信息效用值 (Information Utility) 与自适应权重
+            utility = 1.0 - entropy
+            utility_sum = np.sum(utility)
+            
+            if utility_sum > 1e-6:
+                entropy_weights = utility / utility_sum
+            else:
+                # 若拓扑特征极度均匀（如无限对称图），则退化为均匀分布，保证数值基线稳定
+                entropy_weights = np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float32)
+        else:
+            entropy_weights = np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float32)
+
+        # 4. 通过矩阵内积实现高分辨率的中心性表征向量
+        self.phys_centrality = np.dot(raw_topo_feats, entropy_weights).astype(np.float32)
 
         self.physical_adj_binary: np.ndarray = adjacency_with_self_loops(self.hardware.graph, self.hardware.num_qubits)
         self.physical_adj: np.ndarray = self._build_physical_weighted_adj()
@@ -102,10 +125,24 @@ class InitialLayoutEnv:
         self.logical_order = self._build_logical_order()
         self.front_pair_mask = self._pairs_to_mask(self.logic.front_pairs)
         self.critical_pair_mask = self._pairs_to_mask(self.logic.critical_edges)
+        # 处理用户自定义的 Baseline 指标记录
         if self._compute_baseline_metrics():
             self.baseline_score, self.baseline_name, self.baseline_metrics = self._compute_baseline()
         else:
             self.baseline_score, self.baseline_name, self.baseline_metrics = None, "none", {}
+        
+        # --- 核心修改：工业级鲁棒奖励锚定机制 ---
+        # 无论系统是否记录 baseline 监控指标，内部必须强制生成一个客观分母，以杜绝奖励爆炸
+        self.reward_anchor_score = self.baseline_score
+        if self.reward_anchor_score is None:
+            # 采用低成本高鲁棒性的 dense_layout 作为内部隐式数学锚点
+            fast_layout = dense_layout(self.logic, self.hardware)
+            fast_metrics = evaluate_layout_metrics(self.circuit, fast_layout, self.hardware, self.env_cfg)
+            self.reward_anchor_score = float(objective_from_metrics(fast_metrics, self.reward_cfg, self.env_cfg))
+        
+        # 防止极端小型拓扑下 baseline 计算出 0 导致后续除以 0 异常
+        self.reward_anchor_score = max(float(self.reward_anchor_score), 1e-5)
+
         return self._get_obs()
 
     def _pairs_to_mask(self, pairs: list[tuple[int, int]]) -> np.ndarray:
@@ -424,12 +461,15 @@ class InitialLayoutEnv:
             centered = float((cand["score_raw"] - score_mean) / norm)
             best_gap = float((cand["score_raw"] - float(np.max(scores))) / norm)
 
-        reward = 0.0
-        reward += 0.10 * centered
-        reward += 0.06 * best_gap
-        reward += 0.05 * cand["executable_frontier_ratio"]
-        reward += 0.03 * cand["free_neighbor_ratio"]
-        reward = float(np.clip(reward, -0.35, 0.35))
+        raw_shaping = 0.0
+        raw_shaping += 0.10 * centered
+        raw_shaping += 0.06 * best_gap
+        raw_shaping += 0.05 * cand["executable_frontier_ratio"]
+        raw_shaping += 0.03 * cand["free_neighbor_ratio"]
+        
+        # --- 核心修改：非线性平滑压缩，消除硬裁剪引起的梯度断流 ---
+        # 既保证单步奖励绝不超越目标域 [-0.35, 0.35]，又保证全域可微
+        reward = float(0.35 * np.tanh(raw_shaping / 0.25))
 
         info = {
             "shape_base": -cand["base_dist"],
@@ -532,12 +572,26 @@ class InitialLayoutEnv:
             metrics = evaluate_layout_metrics(self.circuit, layout, self.hardware, self.env_cfg)
             rl_score = objective_from_metrics(metrics, self.reward_cfg, self.env_cfg)
             terminal_objective = float(rl_score)
-            terminal_reward = -float(self.reward_cfg.terminal_scale * terminal_objective)
+            
+            # --- 核心修改：对齐基线锚定 + 线路规模动态自适应缩放 ---
+            # 计算 RL 相对基线的提升比例 (Baseline 越小越好，即优化目标是最小化 score)
+            # 若 RL Score < Anchor Score，说明超越基线，relative_improvement 为正值
+            relative_improvement = (self.reward_anchor_score - terminal_objective) / self.reward_anchor_score
+            
+            # 使用 ln(N) 对线路规模进行软缩放，使 20 比特和 100 比特线路的最终终端奖励期望保持在同一水平线
+            num_qubits_factor = np.log(max(float(self.logic.num_qubits), 2.0))
+            
+            # 此时系统的 terminal_scale 具有明确的物理意义：
+            # 它代表“当 RL 取得 100% 满分优化红利且在线路规模增长时的最大单位奖励放大系数值”
+            terminal_reward = float(self.reward_cfg.terminal_scale * relative_improvement * num_qubits_factor)
+            
             reward += float(terminal_reward)
 
             info.update(metrics)
             info["routing_score"] = float(rl_score)
             info["baseline_score"] = float(self.baseline_score) if self.baseline_score is not None else None
+            info["reward_anchor_score"] = float(self.reward_anchor_score)
+            info["relative_improvement"] = float(relative_improvement)
             info["terminal_objective"] = float(terminal_objective)
             info["final_layout"] = layout
             info["terminal_reward"] = float(terminal_reward)
