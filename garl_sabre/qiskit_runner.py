@@ -217,3 +217,85 @@ def evaluate_layout_metrics(
 def objective_from_metrics(metrics: Dict[str, float | str | None], reward_cfg: RewardConfig, env_cfg: EnvConfig) -> float:
     del reward_cfg, env_cfg
     return float(metrics.get("swap_count", 0.0) or 0.0)
+
+
+import numpy as np
+from qiskit import QuantumCircuit, transpile
+from qiskit.transpiler import CouplingMap
+
+# 动态引入 pytket 桥接生态（需通过 pip install pytket pytket-qiskit 安装）
+try:
+    from pytket.extensions.qiskit import qiskit_to_tk, tk_to_qiskit
+    from pytket.architecture import Architecture
+    from pytket.passes import RoutingPass
+    from pytket.circuit import Qubit, Node
+    HAS_TKET = True
+except ImportError:
+    HAS_TKET = False
+
+def route_with_backend(
+    circuit: QuantumCircuit, 
+    layout: list[int], 
+    hardware, 
+    backend_name: str = "sabre"
+) -> dict[str, float]:
+    """工业级双后端路由调度引擎：支持根据布局锁死运行 Qiskit-Sabre 或 Quantinuum-tket。"""
+    
+    if backend_name == "sabre":
+        # === Qiskit Sabre 路由分支 ===
+        # 将 RL 输出的 list[int] 转化为 Qiskit 兼容的逻辑映射字典
+        initial_layout_dict = {circuit.qubits[i]: layout[i] for i in range(len(layout))}
+        
+        # 强制锁死 layout_method 为 None，仅激活 routing_method
+        routed_circ = transpile(
+            circuit,
+            coupling_map=hardware.coupling_map,
+            initial_layout=initial_layout_dict,
+            layout_method=None,
+            routing_method="sabre",
+            optimization_level=1, # 保持级联优化的纯净度
+            seed_transpiler=42
+        )
+        
+        return {
+            "cnot_count": float(routed_circ.count_ops().get("cx", 0)),
+            "depth": float(routed_circ.depth()),
+            "total_gates": float(sum(routed_circ.count_ops().values()))
+        }
+
+    elif backend_name == "tket":
+        # === Pytket 路由分支 ===
+        if not HAS_TKET:
+            raise ImportError("请先执行 `pip install pytket pytket-qiskit` 以激活 tket 后端。")
+            
+        # 1. 转换量子线路为 tket 内部图表征
+        tk_circ = qiskit_to_tk(circuit)
+        
+        # 2. 将硬件拓扑耦合图转换为 tket Architecture
+        edges = [(int(u), int(v)) for u, v in hardware.coupling_map.get_edges()]
+        tk_architecture = Architecture(edges)
+        
+        # 3. 构造显式初始布局：将 tket 默认的逻辑 Qubit 锁定到 RL 指定的物理 Node 上
+        # tk_circ.qubits 通常对应 [q[0], q[1], ...]
+        placement_map = {}
+        for logical_idx, phys_idx in enumerate(layout):
+            if logical_idx < len(tk_circ.qubits):
+                placement_map[tk_circ.qubits[logical_idx]] = Node(phys_idx)
+        
+        # 4. 显式将初始布局强行注入到线路中
+        tk_circ.with_placement_map(placement_map)
+        
+        # 5. 声明并强制执行严格的全局路由 pass（不允许其私自篡改我们的初始布局）
+        routing_pass = RoutingPass(tk_architecture)
+        routing_pass.apply(tk_circ)
+        
+        # 6. 将路由完结的线路安全回写为 Qiskit 格式以对齐全流程统计口径
+        routed_circ_qiskit = tk_to_qiskit(tk_circ)
+        
+        return {
+            "cnot_count": float(routed_circ_qiskit.count_ops().get("cx", 0)),
+            "depth": float(routed_circ_qiskit.depth()),
+            "total_gates": float(sum(routed_circ_qiskit.count_ops().values()))
+        }
+    else:
+        raise ValueError(f"未知路由后端: {backend_name}")
