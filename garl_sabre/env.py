@@ -120,17 +120,25 @@ class InitialLayoutEnv:
         deg = np.maximum(adj.sum(axis=1, keepdims=True), 1e-8)
         return (adj / deg).astype(np.float32)
 
-    def reset(self, circuit: QuantumCircuit, is_training: Optional[bool] = None) -> Dict:
+    # 修改 reset 方法签名，追加 logic_graph 参数
+    def reset(self, circuit: QuantumCircuit, is_training: Optional[bool] = None, logic_graph: Optional[LogicGraphData] = None) -> Dict:
         if circuit.num_qubits > self.hardware.num_qubits:
             raise ValueError(f"Circuit has {circuit.num_qubits} qubits, but hardware only has {self.hardware.num_qubits}.")
 
-        # --- 核心修改：允许 reset 时动态重置运行模式 ---
         if is_training is not None:
             self.is_training = is_training
 
         self.circuit = circuit.copy()
-        self.logic = build_logic_graph(self.circuit, critical_window=self.env_cfg.critical_window, lookahead_window=self.env_cfg.lookahead_window)
+        
+        # --- 核心修改 3：依赖注入优先。如有缓存图则极速挂载，否则执行回退计算 ---
+        if logic_graph is not None:
+            self.logic = logic_graph
+        else:
+            self.logic = build_logic_graph(self.circuit, critical_window=self.env_cfg.critical_window, lookahead_window=self.env_cfg.lookahead_window)
+            
         self.mapping_log_to_phys = np.full(self.logic.num_qubits, -1, dtype=np.int64)
+        
+        # ... 后续其余代码保持完全不变 ...
         self.used_phys = np.zeros(self.hardware.num_qubits, dtype=np.float32)
         self.step_idx = 0
         self.logical_order = self._build_logical_order()
@@ -449,7 +457,11 @@ class InitialLayoutEnv:
             "physical_action_masks_bank": physical_masks_bank,
             "physical_prior_bank": physical_prior_bank,
             "progress": np.float32(progress),
+
+            # --- 必须补齐的核心广播锚点 ---
+            "is_fixed_order": np.int64(1 if self.env_cfg.action_mode == "fixed_order_physical" else 0),
         }
+        
 
     def _shape_reward_for_choice(self, logical_q: int, phys_q: int) -> tuple[float, Dict[str, float]]:
         free_idx, scores = self._legal_candidate_scores(logical_q)
@@ -510,7 +522,7 @@ class InitialLayoutEnv:
                 coupling_map=self.hardware.coupling_map,
                 layout_method="sabre",
                 routing_method="sabre",
-                optimization_level=0,  # 0阶保证物理映射质量剥离，不涉及逻辑门重组
+                optimization_level=self.env_cfg.optimization_level,
                 seed_transpiler=self.env_cfg.sabre_seed
             )
             sabre_metrics = {
@@ -564,7 +576,7 @@ class InitialLayoutEnv:
                 initial_layout=initial_layout_dict,
                 layout_method=None,  # 强行锁死，阻止 Qiskit 乱动初始位置
                 routing_method="sabre",
-                optimization_level=0,
+                optimization_level=self.env_cfg.optimization_level,
                 seed_transpiler=self.env_cfg.sabre_seed
             )
             return {
@@ -587,7 +599,8 @@ class InitialLayoutEnv:
                 if logical_idx < len(tk_circ.qubits):
                     placement_map[tk_circ.qubits[logical_idx]] = Node(phys_idx)
             
-            tk_circ.with_placement_map(placement_map)
+            from pytket.placement import Placement
+            Placement().place_with_map(tk_circ, placement_map)  # 安全、可控地锁定初始布局
             
             # 调用 tket 核心正统图结构并发交换路由 Pass
             routing_pass = RoutingPass(tk_architecture)
