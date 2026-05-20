@@ -61,7 +61,7 @@ class SearchNode:
 
 
 def build_model_from_env(env, sample_circuit, device, state_dict):
-    obs = env.reset(sample_circuit)
+    obs = env.reset(sample_circuit, is_training=False)
     logic_feat_dim = int(obs["logic_node_features"].shape[-1])
     phys_feat_dim = int(obs["physical_node_features"].shape[-1])
     candidate_feat_dim = int(obs["candidate_features_bank"].shape[-1])
@@ -100,7 +100,7 @@ def run_episode(model, env, circuit, device, deterministic: bool = True,
     if disable_candidate_ranking_eval:
         env.env_cfg.use_candidate_ranking = False
     try:
-        obs = env.reset(circuit)
+        obs = env.reset(circuit, is_training=False)
         done = False
         total_reward = 0.0
         info = {}
@@ -148,7 +148,7 @@ def run_beam_episode(
     if disable_candidate_ranking_eval:
         env.env_cfg.use_candidate_ranking = False
     try:
-        env.reset(circuit)
+        env.reset(circuit, is_training=False)
         beams = [SearchNode(snapshot=env.snapshot(), logprob=0.0, total_reward=0.0, done=False,
                             info={"beam_reward_weight": beam_reward_weight}, mode="beam")]
         completed: List[SearchNode] = []
@@ -214,7 +214,7 @@ def maybe_tabu_refine(best_info: Dict, env: InitialLayoutEnv, circuit, args) -> 
     if layout is None:
         return best_info
     if env.logic is None:
-        env.reset(circuit)
+        env.reset(circuit, is_training=False)
     result = tabu_refine_layout(
         circuit=circuit,
         initial_layout=layout,
