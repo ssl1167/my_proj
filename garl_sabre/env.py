@@ -48,6 +48,9 @@ class InitialLayoutEnv:
         self.front_pair_mask: Optional[np.ndarray] = None
         self.critical_pair_mask: Optional[np.ndarray] = None
 
+        # --- 核心修改：引入有状态运行模式（业界标准 RL 环境流设计） ---
+        self.is_training: bool = True  # 默认激活无损探索训练模式
+
         finite_d = self.hardware.dist[self.hardware.dist < 1e8]
         self.max_dist = float(max(1.0, finite_d.max() if finite_d.size > 0 else 1.0))
 
@@ -78,6 +81,10 @@ class InitialLayoutEnv:
         self.reward_anchor_score: float = 1.0
 
     def _use_candidate_ranking(self) -> bool:
+        # --- 学术级修正：拒绝双重偏置，训练期强制放开全空间 ---
+        if self.is_training:
+            return False  # 训练期间拒绝任何硬掩码拦截，允许模型全域探索未知最优解
+        # 仅在非训练模式（评估、测试或工业推断部署）下，才允许遵从用户配置项
         return bool(getattr(self.env_cfg, "use_candidate_ranking", True))
 
     def _use_physical_prior(self) -> bool:
@@ -113,9 +120,13 @@ class InitialLayoutEnv:
         deg = np.maximum(adj.sum(axis=1, keepdims=True), 1e-8)
         return (adj / deg).astype(np.float32)
 
-    def reset(self, circuit: QuantumCircuit) -> Dict:
+    def reset(self, circuit: QuantumCircuit, is_training: Optional[bool] = None) -> Dict:
         if circuit.num_qubits > self.hardware.num_qubits:
             raise ValueError(f"Circuit has {circuit.num_qubits} qubits, but hardware only has {self.hardware.num_qubits}.")
+
+        # --- 核心修改：允许 reset 时动态重置运行模式 ---
+        if is_training is not None:
+            self.is_training = is_training
 
         self.circuit = circuit.copy()
         self.logic = build_logic_graph(self.circuit, critical_window=self.env_cfg.critical_window, lookahead_window=self.env_cfg.lookahead_window)
@@ -132,7 +143,6 @@ class InitialLayoutEnv:
         # 强制将奖励函数的反事实参照物分母与你指定的单一 baseline_mode 深度锁死
         self.reward_anchor_score = self.baseline_score if self.baseline_score is not None else 1.0
         if self.reward_anchor_score <= 1e-5:
-            # 如果极端线路算出来的 CNOT 开销为 0，用低开销 dense 方案进行保底，规避除零异常
             fast_layout = dense_layout(self.logic, self.hardware)
             metrics = evaluate_layout_metrics(self.circuit, fast_layout, self.hardware, self.env_cfg)
             self.reward_anchor_score = max(float(objective_from_metrics(metrics, self.reward_cfg, self.env_cfg)), 1.0)
