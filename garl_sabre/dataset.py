@@ -11,6 +11,9 @@ from qiskit import QuantumCircuit
 from qiskit.circuit.library import QAOAAnsatz, TwoLocal, QFT
 from qiskit.quantum_info import SparsePauliOp
 
+from .circuit_features import LogicGraphData, build_logic_graph
+from .config import EnvConfig
+
 
 @dataclass
 class CircuitSample:
@@ -19,13 +22,25 @@ class CircuitSample:
     num_qubits: int
     qasm: str
     _cached_circuit: QuantumCircuit | None = field(default=None, init=False, repr=False, compare=False)
+    
+    # --- 核心修改 1：增加逻辑图特征的惰性缓存字段 ---
+    _cached_logic_graph: LogicGraphData | None = field(default=None, init=False, repr=False, compare=False)
 
     def to_circuit(self) -> QuantumCircuit:
-        # Cache parsed QASM to avoid repeated reconstruction during training,
-        # validation and baseline evaluation.
         if self._cached_circuit is None:
             self._cached_circuit = QuantumCircuit.from_qasm_str(self.qasm)
         return self._cached_circuit.copy()
+
+    # --- 核心修改 2：提供带惰性计算的特征获取接口 ---
+    def get_logic_graph(self, env_cfg: EnvConfig) -> LogicGraphData:
+        """安全返回缓存的 LogicGraphData，彻底避免 CPU 重复建图计算。"""
+        if self._cached_logic_graph is None:
+            self._cached_logic_graph = build_logic_graph(
+                self.to_circuit(),
+                critical_window=env_cfg.critical_window,
+                lookahead_window=env_cfg.lookahead_window
+            )
+        return self._cached_logic_graph
 
 
 def save_jsonl(path: Path, rows: Sequence[Dict]) -> None:
