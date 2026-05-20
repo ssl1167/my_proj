@@ -85,9 +85,14 @@ def count_named_gate(circuit: QuantumCircuit, gate_name: str) -> int:
 
 
 def circuit_gate_profile(circuit: QuantumCircuit) -> Dict[str, float]:
-    total_gates = float(len(circuit.data))
+    physical_ops = [
+        item for item in circuit.data
+        if getattr(item, "operation", item[0]).name not in ["barrier", "measure", "rz", "delay"]
+    ]
+
+    total_physical_gates = float(len(physical_ops))
     twoq_gates = float(count_two_qubit_gates(circuit))
-    oneq_gates = max(0.0, total_gates - twoq_gates)
+    oneq_gates = max(0.0, total_physical_gates - twoq_gates)
     swap_count = float(count_swaps(circuit))
     cx_count = float(count_named_gate(circuit, "cx"))
     try:
