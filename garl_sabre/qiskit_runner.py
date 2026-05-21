@@ -101,7 +101,7 @@ def circuit_gate_profile(circuit: QuantumCircuit) -> Dict[str, float]:
         depth = float("nan")
     return {
         "num_qubits": float(circuit.num_qubits),
-        "gate_count_all": total_gates,
+        "gate_count_all": total_physical_gates,
         "oneq_count_all": float(oneq_gates),
         "twoq_count_all": float(twoq_gates),
         "cx_count_all": cx_count,
