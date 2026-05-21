@@ -114,19 +114,33 @@ def _build_metrics(prepared: QuantumCircuit, routed: QuantumCircuit, elapsed: fl
     original_profile = circuit_gate_profile(prepared)
     routed_profile = circuit_gate_profile(routed)
 
-    additional_swap_count = float(routed_profile["swap_count"] - original_profile["swap_count"])
-    additional_cnot_equiv_from_swap = float(3.0 * additional_swap_count)
-    routed_cnot_equiv_count = float(routed_profile["cx_count_all"] + 3.0 * routed_profile["swap_count"])
+    # 1. 核心修正：计算原电路的“等效二比特门”基数（完全对齐 Paper 的 CNOT count 基线）
+    # 公式：所有二比特门总数 + 2 * 未被展开的 SWAP 门数量（因为SWAP已被统计为1个2Q门，需再补2个凑成3等效开销）
+    original_cnot_equiv = original_profile["twoq_count_all"] + 2.0 * original_profile["swap_count"]
+    
+    # 2. 计算路由后电路的“等效二比特门”总数
+    routed_cnot_equiv = routed_profile["twoq_count_all"] + 2.0 * routed_profile["swap_count"]
 
+    # 3. 计算电路映射之后绝对增加的等效 CNOT 总数
+    added_cnot_equiv = max(0.0, float(routed_cnot_equiv - original_cnot_equiv))
+    
+    # 4. 鲁棒地反推添加的 SWAP 门数目 (1 SWAP = 3 Equivalent CNOTs)
+    additional_swap_count = added_cnot_equiv / 3.0
+
+    # 保持原有变量的命名，以便兼容下游原有的字段记录和赋值
+    additional_cnot_equiv_from_swap = added_cnot_equiv
+    routed_cnot_equiv_count = routed_cnot_equiv
+
+    # 其他指标保留以供参考和消融实验，虽然重点看SWAP和2Q，但不删减字典字段，避免下游报 KeyError 打印 null
     additional_gates_total = float(routed_profile["gate_count_all"] - original_profile["gate_count_all"])
     additional_1q_total = float(routed_profile["oneq_count_all"] - original_profile["oneq_count_all"])
     additional_2q_total = float(routed_profile["twoq_count_all"] - original_profile["twoq_count_all"])
     depth_overhead = float(routed_profile["depth"] - original_profile["depth"])
 
     return {
-        # optimization target
+        # optimization target (模型优化目标现在指向最鲁棒的反推值)
         "swap_count": additional_swap_count,
-        "swap_count_source": "exact_swap_ops",
+        "swap_count_source": "cnot_equiv_derived", # 修改备注以指示新的鲁棒统计来源
         "routing_score": additional_swap_count,
         "terminal_objective": additional_swap_count,
         # runtime
