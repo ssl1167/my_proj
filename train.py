@@ -84,7 +84,7 @@ def make_env(args: argparse.Namespace) -> InitialLayoutEnv:
         logic_order_mode=args.logic_order_mode,
         baseline_mode=args.baseline_mode,
         evaluation_mode="legacy",
-        router_backend="qiskit",
+        router_backend=args.router_backend,
     )
     reward_cfg = RewardConfig(terminal_scale=args.terminal_scale)
     return InitialLayoutEnv(hardware, env_cfg, reward_cfg)
@@ -100,7 +100,7 @@ def build_model_from_env(env: InitialLayoutEnv, sample, hidden_dim: int, graph_l
         obs = env.reset(sample.to_circuit(), logic_graph=sample.get_logic_graph(env.env_cfg), baseline_info=sample._cached_baseline)
 
     logic_feat_dim = int(obs["logic_node_features"].shape[-1])
-
+    phys_feat_dim = int(obs["physical_node_features"].shape[-1])
     candidate_feat_dim = int(obs["candidate_features_bank"].shape[-1])
     logical_candidate_feat_dim = int(obs["logical_candidate_features"].shape[-1])
     cfg = ModelConfig(
@@ -485,6 +485,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--action_mode", type=str, default="hierarchical", choices=["hierarchical", "fixed_order_physical"])
     p.add_argument("--logic_order_mode", type=str, default="priority_fixed", choices=["priority_fixed", "front_first", "index"])
     p.add_argument("--baseline_mode", type=str, default="dense", choices=["none", "trivial", "dense", "hybrid"])
+    p.add_argument("--router_backend", type=str, default="qiskit", choices=["qiskit", "tket"])
     p.add_argument("--terminal_scale", type=float, default=1.0)
 
     p.add_argument("--hidden_dim", type=int, default=128)
