@@ -81,11 +81,9 @@ class InitialLayoutEnv:
         self.reward_anchor_score: float = 1.0
 
     def _use_candidate_ranking(self) -> bool:
-        # --- 瀛︽湳绾т慨姝ｏ細鎷掔粷鍙岄噸鍋忕疆锛岃缁冩湡寮哄埗鏀惧紑鍏ㄧ┖闂?---
-        if self.is_training:
-            return False  # 璁粌鏈熼棿鎷掔粷浠讳綍纭帺鐮佹嫤鎴紝鍏佽妯″瀷鍏ㄥ煙鎺㈢储鏈煡鏈€浼樿В
-        # 浠呭湪闈炶缁冩ā寮忥紙璇勪及銆佹祴璇曟垨宸ヤ笟鎺ㄦ柇閮ㄧ讲锛変笅锛屾墠鍏佽閬典粠鐢ㄦ埛閰嶇疆椤?        return bool(getattr(self.env_cfg, "use_candidate_ranking", True))
-
+        # 彻底听从配置，避免训练和测试环境的 MDP（马尔可夫决策过程）空间不一致
+        return bool(getattr(self.env_cfg, "use_candidate_ranking", False))
+        
     def _use_physical_prior(self) -> bool:
         return bool(getattr(self.env_cfg, "use_physical_prior", True))
 
