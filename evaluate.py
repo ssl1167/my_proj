@@ -18,9 +18,13 @@ from garl_sabre.topology import build_hardware_topology
 from garl_sabre.utils import obs_to_torch
 
 EVAL_COLUMNS = [
+    "reward",
     "swap_count",
     "routing_score",
     "terminal_objective",
+    "terminal_reward",
+    "baseline_score",
+    "baseline_name",
     "routing_time_sec",
     "original_num_qubits",
     "original_gate_count_all",
@@ -266,6 +270,7 @@ if __name__ == "__main__":
     p.add_argument("--phys_cols", type=int, default=0)
     p.add_argument("--topology_mode", type=str, default="heavy_hex", choices=["grid", "bottleneck_grid", "ibm_q20", "heavy_hex"])
     p.add_argument("--topology_distance", type=int, default=5)
+    p.add_argument("--router_backend", type=str, default=None, choices=["qiskit", "tket"])
     p.add_argument("--save_csv", type=str, default="outputs/eval.csv")
     p.add_argument("--paper_csv", type=str, default="")
     p.add_argument("--initial_mapper_label", type=str, default="rl+beam+tabu")
@@ -296,6 +301,9 @@ if __name__ == "__main__":
     env_cfg.sabre_seed = args.seed
     env_cfg.topology_mode = args.topology_mode
     env_cfg.topology_distance = args.topology_distance
+    if args.router_backend:
+        env_cfg.router_backend = args.router_backend
+    print(f"Using router backend: {env_cfg.router_backend}")
 
     hardware = build_hardware_topology(args.phys_rows, args.phys_cols, mode=args.topology_mode, distance=args.topology_distance)
     env = InitialLayoutEnv(hardware, env_cfg, reward_cfg)
@@ -359,9 +367,12 @@ if __name__ == "__main__":
             "num_qubits": sample.num_qubits,
             "initial_mapper": args.initial_mapper_label,
             "mode": mode,
+            "reward": float(reward),
         }
         for col in EVAL_COLUMNS:
-            if col == "routed_swap_count":
+            if col == "reward":
+                continue
+            elif col == "routed_swap_count":
                 row[col] = info.get(col, info.get("swap_count", None))
             elif col == "additional_swap_count":
                 row[col] = info.get(col, info.get("swap_count", None))
@@ -401,7 +412,11 @@ if __name__ == "__main__":
     paper_df.to_csv(paper_path, index=False)
 
     print(df.groupby("family")[[
+        "reward",
         "swap_count",
+        "terminal_objective",
+        "terminal_reward",
+        "baseline_score",
         "original_cnot_count_all",
         "routed_cnot_equiv_count",
         "additional_cnot_equiv_from_swap",
