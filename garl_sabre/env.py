@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -9,10 +10,10 @@ from qiskit import QuantumCircuit, transpile
 from .circuit_features import LogicGraphData, build_logic_graph
 from .config import EnvConfig, RewardConfig
 from .heuristics import dense_layout, trivial_layout
-from .qiskit_runner import evaluate_layout_metrics, objective_from_metrics
+from .qiskit_runner import _build_metrics, evaluate_layout_metrics, objective_from_metrics, prepare_basis_circuit
 from .topology import HardwareTopology, adjacency_with_self_loops
 
-# 学术级级联惰性导入：动态探测环境中是否安有 Quantinuum t|ket> 编译生态
+# Optional tket backend support.
 try:
     from pytket.extensions.qiskit import qiskit_to_tk, tk_to_qiskit
     from pytket.architecture import Architecture
@@ -32,7 +33,7 @@ class StepOutput:
 
 
 class InitialLayoutEnv:
-    """高级量子初始映射强化学习环境：融合自适应图熵权、双路由后端评测与可控外部标杆锚定。"""
+    """Initial-layout reinforcement learning environment."""
 
     def __init__(self, hardware: HardwareTopology, env_cfg: EnvConfig | None = None, reward_cfg: RewardConfig | None = None) -> None:
         self.hardware = hardware
@@ -48,13 +49,12 @@ class InitialLayoutEnv:
         self.front_pair_mask: Optional[np.ndarray] = None
         self.critical_pair_mask: Optional[np.ndarray] = None
 
-        # --- 核心修改：引入有状态运行模式（业界标准 RL 环境流设计） ---
-        self.is_training: bool = True  # 默认激活无损探索训练模式
-
+        # --- 鏍稿績淇敼锛氬紩鍏ユ湁鐘舵€佽繍琛屾ā寮忥紙涓氱晫鏍囧噯 RL 鐜娴佽璁★級 ---
+        self.is_training: bool = True  # 榛樿婵€娲绘棤鎹熸帰绱㈣缁冩ā寮?
         finite_d = self.hardware.dist[self.hardware.dist < 1e8]
         self.max_dist = float(max(1.0, finite_d.max() if finite_d.size > 0 else 1.0))
 
-        # ==================== 核心修改 1: 拓扑自适应图论熵权融合引擎 ====================
+        # ==================== 鏍稿績淇敼 1: 鎷撴墤鑷€傚簲鍥捐鐔垫潈铻嶅悎寮曟搸 ====================
         raw_topo_feats = self.hardware.node_features[:, :4].astype(np.float32)
         num_nodes = raw_topo_feats.shape[0]
         if num_nodes > 1:
@@ -81,18 +81,16 @@ class InitialLayoutEnv:
         self.reward_anchor_score: float = 1.0
 
     def _use_candidate_ranking(self) -> bool:
-        # --- 学术级修正：拒绝双重偏置，训练期强制放开全空间 ---
+        # --- 瀛︽湳绾т慨姝ｏ細鎷掔粷鍙岄噸鍋忕疆锛岃缁冩湡寮哄埗鏀惧紑鍏ㄧ┖闂?---
         if self.is_training:
-            return False  # 训练期间拒绝任何硬掩码拦截，允许模型全域探索未知最优解
-        # 仅在非训练模式（评估、测试或工业推断部署）下，才允许遵从用户配置项
-        return bool(getattr(self.env_cfg, "use_candidate_ranking", True))
+            return False  # 璁粌鏈熼棿鎷掔粷浠讳綍纭帺鐮佹嫤鎴紝鍏佽妯″瀷鍏ㄥ煙鎺㈢储鏈煡鏈€浼樿В
+        # 浠呭湪闈炶缁冩ā寮忥紙璇勪及銆佹祴璇曟垨宸ヤ笟鎺ㄦ柇閮ㄧ讲锛変笅锛屾墠鍏佽閬典粠鐢ㄦ埛閰嶇疆椤?        return bool(getattr(self.env_cfg, "use_candidate_ranking", True))
 
     def _use_physical_prior(self) -> bool:
         return bool(getattr(self.env_cfg, "use_physical_prior", True))
 
     def _compute_baseline_metrics(self) -> bool:
-        return True  # 学术级评测流中强制激活基线计算
-
+        return True  # 瀛︽湳绾ц瘎娴嬫祦涓己鍒舵縺娲诲熀绾胯绠?
     def _build_physical_weighted_adj(self) -> np.ndarray:
         n = self.hardware.num_qubits
         adj = np.zeros((n, n), dtype=np.float32)
@@ -120,7 +118,7 @@ class InitialLayoutEnv:
         deg = np.maximum(adj.sum(axis=1, keepdims=True), 1e-8)
         return (adj / deg).astype(np.float32)
 
-    # 扩大参数签名，接收外部缓存的 baseline_info
+    # 鎵╁ぇ鍙傛暟绛惧悕锛屾帴鏀跺閮ㄧ紦瀛樼殑 baseline_info
     def reset(self, circuit: QuantumCircuit, is_training: Optional[bool] = None, logic_graph: Optional[LogicGraphData] = None, baseline_info: Optional[Tuple] = None) -> Dict:
         if circuit.num_qubits > self.hardware.num_qubits:
             raise ValueError(f"Circuit has {circuit.num_qubits} qubits, but hardware only has {self.hardware.num_qubits}.")
@@ -130,7 +128,7 @@ class InitialLayoutEnv:
 
         self.circuit = circuit.copy()
         
-        # --- 核心修改 3：依赖注入优先。如有缓存图则极速挂载，否则执行回退计算 ---
+        # --- 鏍稿績淇敼 3锛氫緷璧栨敞鍏ヤ紭鍏堛€傚鏈夌紦瀛樺浘鍒欐瀬閫熸寕杞斤紝鍚﹀垯鎵ц鍥為€€璁＄畻 ---
         if logic_graph is not None:
             self.logic = logic_graph
         else:
@@ -138,21 +136,21 @@ class InitialLayoutEnv:
             
         self.mapping_log_to_phys = np.full(self.logic.num_qubits, -1, dtype=np.int64)
         
-        # ... 后续其余代码保持完全不变 ...
+        # ... 鍚庣画鍏朵綑浠ｇ爜淇濇寔瀹屽叏涓嶅彉 ...
         self.used_phys = np.zeros(self.hardware.num_qubits, dtype=np.float32)
         self.step_idx = 0
         self.logical_order = self._build_logical_order()
         self.front_pair_mask = self._pairs_to_mask(self.logic.front_pairs)
         self.critical_pair_mask = self._pairs_to_mask(self.logic.critical_edges)
         
-        # ==================== 核心修改 2: 锁死单一公认外部标杆，斩断 hybrid 漏洞 ====================
-        # ==================== 核心修改：短路基线计算 ====================
+        # ==================== 鏍稿績淇敼 2: 閿佹鍗曚竴鍏澶栭儴鏍囨潌锛屾柀鏂?hybrid 婕忔礊 ====================
+        # ==================== 鏍稿績淇敼锛氱煭璺熀绾胯绠?====================
         if baseline_info is not None:
             self.baseline_score, self.baseline_name, self.baseline_metrics = baseline_info
         else:
             self.baseline_score, self.baseline_name, self.baseline_metrics = self._compute_baseline()
         
-        # 强制将奖励函数的反事实参照物分母与你指定的单一 baseline_mode 深度锁死
+        # 寮哄埗灏嗗鍔卞嚱鏁扮殑鍙嶄簨瀹炲弬鐓х墿鍒嗘瘝涓庝綘鎸囧畾鐨勫崟涓€ baseline_mode 娣卞害閿佹
         self.reward_anchor_score = self.baseline_score if self.baseline_score is not None else 1.0
         if self.reward_anchor_score <= 1e-5:
             fast_layout = dense_layout(self.logic, self.hardware)
@@ -462,7 +460,7 @@ class InitialLayoutEnv:
             "physical_prior_bank": physical_prior_bank,
             "progress": np.float32(progress),
 
-            # --- 必须补齐的核心广播锚点 ---
+            
             "is_fixed_order": np.int64(1 if self.env_cfg.action_mode == "fixed_order_physical" else 0),
         }
         
@@ -488,7 +486,7 @@ class InitialLayoutEnv:
         reward += 0.05 * cand["executable_frontier_ratio"]
         reward += 0.03 * cand["free_neighbor_ratio"]
         
-        # ==================== 核心修改 3: 双曲正切平滑激活，替换硬裁剪 ====================
+        # ==================== 鏍稿績淇敼 3: 鍙屾洸姝ｅ垏骞虫粦婵€娲伙紝鏇挎崲纭鍓?====================
         reward = float(0.35 * np.tanh(reward / 0.25))
         # ==============================================================================
 
@@ -512,15 +510,15 @@ class InitialLayoutEnv:
         return reward, info
 
     def _compute_baseline(self) -> tuple[Optional[float], str, Dict[str, float]]:
-        """最高学术水准的基线评测黑盒：支持标准的 Sabre 初始映射。"""
+        """Compute the configured external baseline metrics."""
         assert self.circuit is not None and self.logic is not None
         mode = self.env_cfg.baseline_mode
         if mode == "none":
             return None, "none", {}
 
-        # 1. 锁死工业黄金基线 Qiskit-Sabre 分数
+        # 1. 閿佹宸ヤ笟榛勯噾鍩虹嚎 Qiskit-Sabre 鍒嗘暟
         if mode == "sabre":
-            # 激活 Qiskit 官方一揽子 Sabre 映射编译，使用环境指定的随机种子
+            # 婵€娲?Qiskit 瀹樻柟涓€鎻藉瓙 Sabre 鏄犲皠缂栬瘧锛屼娇鐢ㄧ幆澧冩寚瀹氱殑闅忔満绉嶅瓙
             sabre_routed_circ = transpile(
                 self.circuit,
                 coupling_map=self.hardware.coupling_map,
@@ -536,7 +534,7 @@ class InitialLayoutEnv:
             sabre_score = float(sabre_metrics["cnot_count"])
             return sabre_score, "sabre", sabre_metrics
 
-        # 2. 保留原有的常规紧凑和微弱基线分支（仅限非sabre状态）
+        # 2. 淇濈暀鍘熸湁鐨勫父瑙勭揣鍑戝拰寰急鍩虹嚎鍒嗘敮锛堜粎闄愰潪sabre鐘舵€侊級
         candidates: list[tuple[str, list[int]]] = []
         if mode == "trivial":
             candidates.append(("trivial", trivial_layout(self.logic.num_qubits)))
@@ -568,56 +566,40 @@ class InitialLayoutEnv:
         return int(action[0]), int(action[1])
 
     def _execute_dual_backend_routing(self, layout: list[int]) -> Dict[str, float]:
-        """核心路由模块：无缝解耦支持 Qiskit-Sabre 或 Quantinuum-tket 路由流。"""
+        """Run the configured router backend and return routing metrics."""
         backend = self.env_cfg.router_backend
         
         if backend == "qiskit":
-            # 锁死由强化学习环境层演进出的布局映射，禁止后续路由算法擅自更改 Initial Layout
-            initial_layout_dict = {self.circuit.qubits[i]: layout[i] for i in range(len(layout))}
-            routed_circ = transpile(
-                self.circuit,
-                coupling_map=self.hardware.coupling_map,
-                initial_layout=initial_layout_dict,
-                layout_method=None,  # 强行锁死，阻止 Qiskit 乱动初始位置
-                routing_method="sabre",
-                optimization_level=self.env_cfg.optimization_level,
-                seed_transpiler=self.env_cfg.sabre_seed
-            )
-            return {
-                "cnot_count": float(routed_circ.count_ops().get("cx", 0)),
-                "depth": float(routed_circ.depth())
-            }
+            return evaluate_layout_metrics(self.circuit, layout, self.hardware, self.env_cfg)
             
         elif backend == "tket":
             if not HAS_TKET:
-                raise ImportError("未探测到 pytket 生态，请执行 `pip install pytket pytket-qiskit`。")
+                raise ImportError("pytket is required for router_backend='tket'. Install pytket and pytket-qiskit.")
             
-            # 将 Qiskit 线路骨架平滑序列化至 pytket 核心图表征
-            tk_circ = qiskit_to_tk(self.circuit)
+            prepared = prepare_basis_circuit(self.circuit, self.env_cfg)
+            tk_circ = qiskit_to_tk(prepared)
             edges = [(int(u), int(v)) for u, v in self.hardware.coupling_map.get_edges()]
             tk_architecture = Architecture(edges)
             
-            # 将强化学习网络生成的布局锁死到 tket 节点双射映射字典上
             placement_map = {}
             for logical_idx, phys_idx in enumerate(layout):
                 if logical_idx < len(tk_circ.qubits):
                     placement_map[tk_circ.qubits[logical_idx]] = Node(phys_idx)
             
             from pytket.placement import Placement
-            Placement().place_with_map(tk_circ, placement_map)  # 安全、可控地锁定初始布局
+            Placement(tk_architecture).place_with_map(tk_circ, placement_map)
             
-            # 调用 tket 核心正统图结构并发交换路由 Pass
+            # 璋冪敤 tket 鏍稿績姝ｇ粺鍥剧粨鏋勫苟鍙戜氦鎹㈣矾鐢?Pass
+            start = time.perf_counter()
             routing_pass = RoutingPass(tk_architecture)
             routing_pass.apply(tk_circ)
+            elapsed = time.perf_counter() - start
             
-            # 重新安全回写为 Qiskit 线路格式以保持全局统计口径绝对对齐
+            # 閲嶆柊瀹夊叏鍥炲啓涓?Qiskit 绾胯矾鏍煎紡浠ヤ繚鎸佸叏灞€缁熻鍙ｅ緞缁濆瀵归綈
             routed_circ_qiskit = tk_to_qiskit(tk_circ)
-            return {
-                "cnot_count": float(routed_circ_qiskit.count_ops().get("cx", 0)),
-                "depth": float(routed_circ_qiskit.depth())
-            }
+            return _build_metrics(prepared, routed_circ_qiskit, elapsed, evaluating_router="tket")
         else:
-            raise ValueError(f"不受支持的路由后端: {backend}")
+            raise ValueError(f"涓嶅彈鏀寔鐨勮矾鐢卞悗绔? {backend}")
 
     def step(self, action: int | Sequence[int] | np.ndarray) -> StepOutput:
         assert self.logic is not None and self.mapping_log_to_phys is not None and self.used_phys is not None and self.circuit is not None
@@ -650,14 +632,14 @@ class InitialLayoutEnv:
         if done:
             layout = self.mapping_log_to_phys.tolist()
             
-            # ==================== 核心修改 4: 激活双后端动态自适应终结回报对齐公式 ====================
+           
             metrics = self._execute_dual_backend_routing(layout)
-            terminal_objective = float(metrics["cnot_count"])
+            terminal_objective = float(objective_from_metrics(metrics, self.reward_cfg, self.env_cfg))
             
-            # 计算当前 RL 结果相比固定外部基线的相对优化提升红利率
+            
             relative_improvement = (self.reward_anchor_score - terminal_objective) / self.reward_anchor_score
             
-            # 使用线性缩放实现绝对的 MDP 价值对齐，拒绝 Reward Hacking 
+            
             num_qubits_factor = float(self.logic.num_qubits)  
 
             terminal_reward = float(self.reward_cfg.terminal_scale * relative_improvement * num_qubits_factor)
