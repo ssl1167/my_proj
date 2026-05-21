@@ -186,7 +186,6 @@ def transpile_with_layout(
         basis_gates=_routing_basis_gates(env_cfg),
         routing_method="sabre",
         initial_layout=layout,
-        layout_method="trivial",
         optimization_level=env_cfg.optimization_level,
         seed_transpiler=env_cfg.sabre_seed,
     )
