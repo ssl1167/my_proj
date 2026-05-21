@@ -10,7 +10,7 @@ from qiskit import QuantumCircuit, transpile
 from .circuit_features import LogicGraphData, build_logic_graph
 from .config import EnvConfig, RewardConfig
 from .heuristics import dense_layout, trivial_layout
-from .qiskit_runner import _build_metrics, evaluate_layout_metrics, objective_from_metrics, prepare_basis_circuit
+from .qiskit_runner import _build_metrics, _routing_basis_gates, evaluate_layout_metrics, objective_from_metrics, prepare_basis_circuit
 from .topology import HardwareTopology, adjacency_with_self_loops
 
 # Optional tket backend support.
@@ -143,8 +143,8 @@ class InitialLayoutEnv:
         self.front_pair_mask = self._pairs_to_mask(self.logic.front_pairs)
         self.critical_pair_mask = self._pairs_to_mask(self.logic.critical_edges)
         
-        # ==================== 鏍稿績淇敼 2: 閿佹鍗曚竴鍏澶栭儴鏍囨潌锛屾柀鏂?hybrid 婕忔礊 ====================
-        # ==================== 鏍稿績淇敼锛氱煭璺熀绾胯绠?====================
+        # ==================== 核心修改 2: 锁死单一公认外部标杆，斩断 hybrid 漏洞 ====================
+        # ==================== 核心修改：短路基线计算 ====================
         if baseline_info is not None:
             self.baseline_score, self.baseline_name, self.baseline_metrics = baseline_info
         else:
@@ -516,22 +516,20 @@ class InitialLayoutEnv:
         if mode == "none":
             return None, "none", {}
 
-        # 1. 閿佹宸ヤ笟榛勯噾鍩虹嚎 Qiskit-Sabre 鍒嗘暟
+        # 1. 学术级工业标杆 Qiskit-Sabre 分数
         if mode == "sabre":
-            # 婵€娲?Qiskit 瀹樻柟涓€鎻藉瓙 Sabre 鏄犲皠缂栬瘧锛屼娇鐢ㄧ幆澧冩寚瀹氱殑闅忔満绉嶅瓙
+            prepared = prepare_basis_circuit(self.circuit, self.env_cfg)
             sabre_routed_circ = transpile(
-                self.circuit,
+                prepared,
                 coupling_map=self.hardware.coupling_map,
+                basis_gates=_routing_basis_gates(self.env_cfg),
                 layout_method="sabre",
                 routing_method="sabre",
                 optimization_level=self.env_cfg.optimization_level,
                 seed_transpiler=self.env_cfg.sabre_seed
             )
-            sabre_metrics = {
-                "cnot_count": float(sabre_routed_circ.count_ops().get("cx", 0)),
-                "depth": float(sabre_routed_circ.depth())
-            }
-            sabre_score = float(sabre_metrics["cnot_count"])
+            sabre_metrics = _build_metrics(prepared, sabre_routed_circ, 0.0, "qiskit_sabre")
+            sabre_score = float(objective_from_metrics(sabre_metrics, self.reward_cfg, self.env_cfg))
             return sabre_score, "sabre", sabre_metrics
 
         # 2. 淇濈暀鍘熸湁鐨勫父瑙勭揣鍑戝拰寰急鍩虹嚎鍒嗘敮锛堜粎闄愰潪sabre鐘舵€侊級
@@ -632,14 +630,14 @@ class InitialLayoutEnv:
         if done:
             layout = self.mapping_log_to_phys.tolist()
             
-           
+            # ==================== 鏍稿績淇敼 4: 婵€娲诲弻鍚庣鍔ㄦ€佽嚜閫傚簲缁堢粨鍥炴姤瀵归綈鍏紡 ====================
             metrics = self._execute_dual_backend_routing(layout)
             terminal_objective = float(objective_from_metrics(metrics, self.reward_cfg, self.env_cfg))
             
-            
+            # 璁＄畻褰撳墠 RL 缁撴灉鐩告瘮鍥哄畾澶栭儴鍩虹嚎鐨勭浉瀵逛紭鍖栨彁鍗囩孩鍒╃巼
             relative_improvement = (self.reward_anchor_score - terminal_objective) / self.reward_anchor_score
             
-            
+            # 浣跨敤绾挎€х缉鏀惧疄鐜扮粷瀵圭殑 MDP 浠峰€煎榻愶紝鎷掔粷 Reward Hacking 
             num_qubits_factor = float(self.logic.num_qubits)  
 
             terminal_reward = float(self.reward_cfg.terminal_scale * relative_improvement * num_qubits_factor)
