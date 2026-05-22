@@ -24,19 +24,6 @@ _PREPARED_BASIS = "_garl_basis_gates"
 _PREPARED_OPT = "_garl_basis_opt_level"
 
 
-def _routing_basis_gates(env_cfg: EnvConfig) -> List[str]:
-    """
-    Keep SWAP explicit in the routed circuit so that we can report both:
-    - exact additional SWAP count
-    - total routed gate count
-    - CNOT-equivalent cost induced by inserted SWAPs
-    """
-    basis = list(env_cfg.basis_gates)
-    if "swap" not in basis:
-        basis.append("swap")
-    return basis
-
-
 def prepare_basis_circuit(circuit: QuantumCircuit, env_cfg: EnvConfig | None = None) -> QuantumCircuit:
     env_cfg = env_cfg or EnvConfig()
     metadata = dict(circuit.metadata or {})
@@ -45,7 +32,8 @@ def prepare_basis_circuit(circuit: QuantumCircuit, env_cfg: EnvConfig | None = N
     if (
         metadata.get(_PREPARED_FLAG, False)
         and tuple(metadata.get(_PREPARED_BASIS, ())) == basis_tag
-        and int(metadata.get(_PREPARED_OPT, -1)) == 0
+        # 修复点 1: 完美对齐当前配置的优化等级，激活毫秒级缓存机制
+        and int(metadata.get(_PREPARED_OPT, -1)) == env_cfg.optimization_level
     ):
         return circuit
 
@@ -207,7 +195,8 @@ def transpile_with_layout(
     routed = transpile(
         prepared,
         coupling_map=hardware.coupling_map,
-        basis_gates=_routing_basis_gates(env_cfg),
+        # 修复点 2: 严格遵守硬件原生的 basis_gates，允许 Qiskit 粉碎 SWAP 并触发深层门消除
+        basis_gates=env_cfg.basis_gates,
         routing_method="sabre",
         initial_layout=layout,
         optimization_level=env_cfg.optimization_level,
@@ -244,15 +233,15 @@ def evaluate_layout_metrics(
         prepared = prepare_basis_circuit(circuit, env_cfg)
         tk_circ = qiskit_to_tk(prepared)
         
-        # 核心修复：强制统一图节点的命名空间为 TKNode("q", index)，切断 NP-Hard 的触发机制
-        edges = [(TKNode(int(u)), TKNode(int(v))) for u, v in hardware.coupling_map.get_edges()]
+        # 强制指定寄存器名称为 "q"，完美兼容任何版本的 qiskit_to_tk
+        edges = [(TKNode("q", int(u)), TKNode("q", int(v))) for u, v in hardware.coupling_map.get_edges()]
         tk_architecture = Architecture(edges)
         
         placement_map = {}
         for logical_idx, phys_idx in enumerate(layout):
             if logical_idx < len(tk_circ.qubits):
-                # 两边必须都是 TKNode
-                placement_map[tk_circ.qubits[logical_idx]] = TKNode(int(phys_idx))
+                # 两边强制完全同构：TKNode("q", xxx)
+                placement_map[tk_circ.qubits[logical_idx]] = TKNode("q", int(phys_idx))
                 
         from pytket.placement import Placement
         Placement(tk_architecture).place_with_map(tk_circ, placement_map)
