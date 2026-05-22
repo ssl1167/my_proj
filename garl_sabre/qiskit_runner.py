@@ -9,6 +9,16 @@ from qiskit.compiler import transpile
 from .config import EnvConfig, RewardConfig
 from .topology import HardwareTopology
 
+# --- 1. 在文件顶部引入相关的库 ---
+try:
+    from pytket.extensions.qiskit import qiskit_to_tk, tk_to_qiskit
+    from pytket.architecture import Architecture
+    from pytket.passes import RoutingPass
+    from pytket.circuit import Node as TKNode
+    HAS_TKET = True
+except ImportError:
+    HAS_TKET = False
+
 _PREPARED_FLAG = "_garl_basis_prepared"
 _PREPARED_BASIS = "_garl_basis_gates"
 _PREPARED_OPT = "_garl_basis_opt_level"
@@ -217,6 +227,7 @@ def evaluate_initial_mapping_with_router(
     return transpile_with_layout(circuit, list(layout), hardware, env_cfg)
 
 
+# --- 2. 重写 evaluate_layout_metrics 函数 ---
 def evaluate_layout_metrics(
     circuit: QuantumCircuit,
     layout: Sequence[int],
@@ -224,7 +235,39 @@ def evaluate_layout_metrics(
     env_cfg: EnvConfig | None = None,
 ) -> Dict[str, float | str]:
     env_cfg = env_cfg or EnvConfig()
-    return transpile_with_layout(circuit, list(layout), hardware, env_cfg)
+    
+    # 统一管控双后端，修复 Tabu Search 等处被绕过的漏洞
+    if getattr(env_cfg, "router_backend", "qiskit") == "tket":
+        if not HAS_TKET:
+            raise ImportError("pytket is required for router_backend='tket'.")
+        
+        prepared = prepare_basis_circuit(circuit, env_cfg)
+        tk_circ = qiskit_to_tk(prepared)
+        
+        # 核心修复：强制统一图节点的命名空间为 TKNode("q", index)，切断 NP-Hard 的触发机制
+        edges = [(TKNode(int(u)), TKNode(int(v))) for u, v in hardware.coupling_map.get_edges()]
+        tk_architecture = Architecture(edges)
+        
+        placement_map = {}
+        for logical_idx, phys_idx in enumerate(layout):
+            if logical_idx < len(tk_circ.qubits):
+                # 两边必须都是 TKNode
+                placement_map[tk_circ.qubits[logical_idx]] = TKNode(int(phys_idx))
+                
+        from pytket.placement import Placement
+        Placement(tk_architecture).place_with_map(tk_circ, placement_map)
+        
+        start = time.perf_counter()
+        routing_pass = RoutingPass(tk_architecture)
+        routing_pass.apply(tk_circ)
+        elapsed = time.perf_counter() - start
+        
+        routed_circ_qiskit = tk_to_qiskit(tk_circ)
+        return _build_metrics(prepared, routed_circ_qiskit, elapsed, evaluating_router="tket")
+        
+    else:
+        # 默认回退至 Qiskit Sabre
+        return transpile_with_layout(circuit, list(layout), hardware, env_cfg)
 
 
 def objective_from_metrics(metrics: Dict[str, float | str | None], reward_cfg: RewardConfig, env_cfg: EnvConfig) -> float:
