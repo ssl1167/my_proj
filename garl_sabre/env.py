@@ -10,7 +10,7 @@ from qiskit import QuantumCircuit, transpile
 from .circuit_features import LogicGraphData, build_logic_graph
 from .config import EnvConfig, RewardConfig
 from .heuristics import dense_layout, trivial_layout
-from .qiskit_runner import _build_metrics, _routing_basis_gates, evaluate_layout_metrics, objective_from_metrics, prepare_basis_circuit
+from .qiskit_runner import _build_metrics, evaluate_layout_metrics, objective_from_metrics, prepare_basis_circuit
 from .topology import HardwareTopology, adjacency_with_self_loops
 
 
@@ -510,7 +510,8 @@ class InitialLayoutEnv:
             sabre_routed_circ = transpile(
                 prepared,
                 coupling_map=self.hardware.coupling_map,
-                basis_gates=_routing_basis_gates(self.env_cfg),
+                # 修复点 3: 基线同样使用原生 basis_gates，让 Sabre 基准分也享受门抵消红利
+                basis_gates=self.env_cfg.basis_gates,
                 layout_method="sabre",
                 routing_method="sabre",
                 optimization_level=self.env_cfg.optimization_level,
