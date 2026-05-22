@@ -13,16 +13,6 @@ from .heuristics import dense_layout, trivial_layout
 from .qiskit_runner import _build_metrics, _routing_basis_gates, evaluate_layout_metrics, objective_from_metrics, prepare_basis_circuit
 from .topology import HardwareTopology, adjacency_with_self_loops
 
-# Optional tket backend support.
-try:
-    from pytket.extensions.qiskit import qiskit_to_tk, tk_to_qiskit
-    from pytket.architecture import Architecture
-    from pytket.passes import RoutingPass
-    from pytket.circuit import Node
-    HAS_TKET = True
-except ImportError:
-    HAS_TKET = False
-
 
 @dataclass
 class StepOutput:
@@ -81,7 +71,7 @@ class InitialLayoutEnv:
         self.reward_anchor_score: float = 1.0
 
     def _use_candidate_ranking(self) -> bool:
-        # 彻底听从配置，避免训练和测试环境的 MDP（马尔可夫决策过程）空间不一致
+       # 彻底听从配置，避免训练和测试环境的 MDP（马尔可夫决策过程）空间不一致
         return bool(getattr(self.env_cfg, "use_candidate_ranking", False))
         
     def _use_physical_prior(self) -> bool:
@@ -563,39 +553,8 @@ class InitialLayoutEnv:
 
     def _execute_dual_backend_routing(self, layout: list[int]) -> Dict[str, float]:
         """Run the configured router backend and return routing metrics."""
-        backend = self.env_cfg.router_backend
-        
-        if backend == "qiskit":
-            return evaluate_layout_metrics(self.circuit, layout, self.hardware, self.env_cfg)
-            
-        elif backend == "tket":
-            if not HAS_TKET:
-                raise ImportError("pytket is required for router_backend='tket'. Install pytket and pytket-qiskit.")
-            
-            prepared = prepare_basis_circuit(self.circuit, self.env_cfg)
-            tk_circ = qiskit_to_tk(prepared)
-            edges = [(int(u), int(v)) for u, v in self.hardware.coupling_map.get_edges()]
-            tk_architecture = Architecture(edges)
-            
-            placement_map = {}
-            for logical_idx, phys_idx in enumerate(layout):
-                if logical_idx < len(tk_circ.qubits):
-                    placement_map[tk_circ.qubits[logical_idx]] = Node(phys_idx)
-            
-            from pytket.placement import Placement
-            Placement(tk_architecture).place_with_map(tk_circ, placement_map)
-            
-            # 璋冪敤 tket 鏍稿績姝ｇ粺鍥剧粨鏋勫苟鍙戜氦鎹㈣矾鐢?Pass
-            start = time.perf_counter()
-            routing_pass = RoutingPass(tk_architecture)
-            routing_pass.apply(tk_circ)
-            elapsed = time.perf_counter() - start
-            
-            # 閲嶆柊瀹夊叏鍥炲啓涓?Qiskit 绾胯矾鏍煎紡浠ヤ繚鎸佸叏灞€缁熻鍙ｅ緞缁濆瀵归綈
-            routed_circ_qiskit = tk_to_qiskit(tk_circ)
-            return _build_metrics(prepared, routed_circ_qiskit, elapsed, evaluating_router="tket")
-        else:
-            raise ValueError(f"涓嶅彈鏀寔鐨勮矾鐢卞悗绔? {backend}")
+        # 直接调用底层的 evaluate_layout_metrics，那里已经统一拦截并处理了 qiskit 和 tket
+        return evaluate_layout_metrics(self.circuit, layout, self.hardware, self.env_cfg)
 
     def step(self, action: int | Sequence[int] | np.ndarray) -> StepOutput:
         assert self.logic is not None and self.mapping_log_to_phys is not None and self.used_phys is not None and self.circuit is not None
