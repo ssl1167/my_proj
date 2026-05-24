@@ -107,24 +107,31 @@ def evaluate_rl_model(samples: List[CircuitSample], checkpoint_path: str, hardwa
             "swap_count": info.get("swap_count", None),
             "routing_score": info.get("routing_score", None),
             "routing_time_sec": info.get("routing_time_sec", info.get("runtime", None)),
+            
             "original_gate_count_all": info.get("original_gate_count_all", None),
             "original_1q_count_all": info.get("original_1q_count_all", None),
             "original_2q_count_all": info.get("original_2q_count_all", None),
             "original_cnot_count_all": info.get("original_cnot_count_all", None),
+            "original_swap_raw_count": info.get("original_swap_raw_count", None),
             "original_depth": info.get("original_depth", None),
+            
             "routed_gate_count_all": info.get("routed_gate_count_all", None),
             "routed_1q_count_all": info.get("routed_1q_count_all", None),
             "routed_2q_count_all": info.get("routed_2q_count_all", None),
-            "routed_swap_count": info.get("routed_swap_count", info.get("swap_count", None)),
             "routed_cnot_raw_count": info.get("routed_cnot_raw_count", None),
+            "routed_swap_raw_count": info.get("routed_swap_raw_count", None),
             "routed_cnot_equiv_count": info.get("routed_cnot_equiv_count", None),
             "routed_depth": info.get("routed_depth", None),
+            
             "additional_gates_total": info.get("additional_gates_total", None),
             "additional_1q_total": info.get("additional_1q_total", None),
             "additional_2q_total": info.get("additional_2q_total", None),
-            "additional_swap_count": info.get("additional_swap_count", info.get("swap_count", None)),
-            "additional_cnot_equiv_from_swap": info.get("additional_cnot_equiv_from_swap", None),
+            "additional_cx_total": info.get("additional_cx_total", None),
+            "additional_swap_raw": info.get("additional_swap_raw", None),
+            "additional_cnot_equiv_from_routing": info.get("additional_cnot_equiv_from_routing", None),
+            "derived_swap_equiv_from_2q": info.get("derived_swap_equiv_from_2q", None),
             "depth_overhead": info.get("depth_overhead", None),
+            
             "evaluating_router": info.get("evaluating_router", "qiskit_sabre"),
         })
     return rows
@@ -168,8 +175,9 @@ def generate_comparison_table(df: pd.DataFrame, output_path: Path):
         "original_cnot_count_all",
         "routed_cnot_equiv_count",
         "routed_cnot_raw_count",
-        "additional_cnot_equiv_from_swap",
-        "additional_swap_count",
+        "additional_cnot_equiv_from_routing",
+        "derived_swap_equiv_from_2q",
+        "routed_swap_raw_count",
         "routing_time_sec",
         "depth_overhead",
     ]
@@ -202,8 +210,9 @@ def generate_comparison_table(df: pd.DataFrame, output_path: Path):
         "original_cnot_count_all",
         "routed_cnot_equiv_count",
         "routed_cnot_raw_count",
-        "additional_cnot_equiv_from_swap",
-        "additional_swap_count",
+        "additional_cnot_equiv_from_routing",
+        "derived_swap_equiv_from_2q",
+        "routed_swap_raw_count",
         "routing_score",
         "routing_time_sec",
         "depth_overhead",
@@ -215,7 +224,7 @@ def generate_comparison_table(df: pd.DataFrame, output_path: Path):
 
     if rl_method in df["method"].unique():
         print("\n=== 按 family 汇总 (RL+beam+tabu) ===")
-        family_cols = [c for c in ["swap_count", "original_cnot_count_all", "routed_cnot_equiv_count", "additional_cnot_equiv_from_swap", "depth_overhead"] if c in df.columns]
+        family_cols = [c for c in ["swap_count", "original_cnot_count_all", "routed_cnot_equiv_count", "additional_cnot_equiv_from_routing", "derived_swap_equiv_from_2q", "depth_overhead"] if c in df.columns]
         if family_cols:
             print(df[df["method"] == rl_method].groupby("family")[family_cols].agg(["mean", "std"]).round(2))
 
@@ -284,6 +293,7 @@ def main():
     generate_comparison_table(df, comparison_path)
 
     paper_table_path = output_path / "paper_table.csv"
+    # 这里更新了最终导出的核心字段，方便放到论文里
     df[[
         "family",
         "name",
@@ -292,8 +302,9 @@ def main():
         "original_cnot_count_all",
         "routed_cnot_equiv_count",
         "routed_cnot_raw_count",
-        "additional_cnot_equiv_from_swap",
-        "additional_swap_count",
+        "additional_cnot_equiv_from_routing",
+        "derived_swap_equiv_from_2q",
+        "routed_swap_raw_count",
         "routing_time_sec",
     ]].to_csv(paper_table_path, index=False)
     print(f"论文表格已保存到 {paper_table_path}")
