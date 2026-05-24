@@ -29,19 +29,22 @@ METRIC_FIELDS = [
     "original_1q_count_all",
     "original_2q_count_all",
     "original_cnot_count_all",
+    "original_swap_raw_count",
     "original_depth",
     "routed_gate_count_all",
     "routed_1q_count_all",
     "routed_2q_count_all",
     "routed_cnot_raw_count",
+    "routed_swap_raw_count",
     "routed_cnot_equiv_count",
-    "routed_swap_count",
     "routed_depth",
     "additional_gates_total",
     "additional_1q_total",
     "additional_2q_total",
-    "additional_swap_count",
-    "additional_cnot_equiv_from_swap",
+    "additional_cx_total",
+    "additional_swap_raw",
+    "additional_cnot_equiv_from_routing",
+    "derived_swap_equiv_from_2q",
     "depth_overhead",
 ]
 
@@ -457,10 +460,10 @@ def run_training(args: argparse.Namespace) -> None:
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Clean swap-only trainer with unified gate accounting.")
-    p.add_argument("--dataset_dir", type=str, default="data/demo")
+    p.add_argument("--dataset_dir", type=str, default="data1_40q")
     p.add_argument("--train_manifest", type=str, default="")
     p.add_argument("--valid_manifest", type=str, default="")
-    p.add_argument("--save_dir", type=str, default="outputs/ppo_clean_run")
+    p.add_argument("--save_dir", type=str, default="outputs/0524")
     p.add_argument("--generate_dataset", action="store_true")
     p.add_argument("--num_circuits", type=int, default=120)
     p.add_argument("--families", nargs="+", default=["qaoa", "hea", "qft", "grover", "adder", "random", "routing_stress"])
@@ -483,9 +486,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--disable_candidate_ranking", action="store_true")
     p.add_argument("--optimization_level", type=int, default=0)
     p.add_argument("--action_mode", type=str, default="hierarchical", choices=["hierarchical", "fixed_order_physical"])
-    p.add_argument("--logic_order_mode", type=str, default="priority_fixed", choices=["priority_fixed", "front_first", "index"])
-    p.add_argument("--baseline_mode", type=str, default="dense", choices=["none", "trivial", "dense", "hybrid"])
-    p.add_argument("--router_backend", type=str, default="qiskit", choices=["qiskit", "tket"])
+    
     p.add_argument("--terminal_scale", type=float, default=1.0)
 
     p.add_argument("--hidden_dim", type=int, default=128)
@@ -515,6 +516,11 @@ def build_argparser() -> argparse.ArgumentParser:
 
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--cpu", action="store_true")
+
+    p.add_argument("--logic_order_mode", type=str, default="priority_fixed", choices=["priority_fixed", "front_first", "index"])
+    # 增加 sabre 到 choices
+    p.add_argument("--baseline_mode", type=str, default="dense", choices=["none", "trivial", "dense", "hybrid", "sabre"])
+    p.add_argument("--router_backend", type=str, default="qiskit", choices=["qiskit", "tket"])
     return p
 
 
