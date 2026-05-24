@@ -31,19 +31,22 @@ EVAL_COLUMNS = [
     "original_1q_count_all",
     "original_2q_count_all",
     "original_cnot_count_all",
+    "original_swap_raw_count",
     "original_depth",
     "routed_gate_count_all",
     "routed_1q_count_all",
     "routed_2q_count_all",
     "routed_cnot_raw_count",
+    "routed_swap_raw_count",
     "routed_cnot_equiv_count",
-    "routed_swap_count",
     "routed_depth",
     "additional_gates_total",
     "additional_1q_total",
     "additional_2q_total",
-    "additional_swap_count",
-    "additional_cnot_equiv_from_swap",
+    "additional_cx_total",
+    "additional_swap_raw",
+    "additional_cnot_equiv_from_routing",
+    "derived_swap_equiv_from_2q",
     "depth_overhead",
     "evaluating_router",
 ]
@@ -373,7 +376,7 @@ if __name__ == "__main__":
             if col == "reward":
                 continue
             elif col == "routed_swap_count":
-                row[col] = info.get(col, info.get("swap_count", None))
+                row[col] = info.get(col, info.get("routed_swap_raw_count", None))
             elif col == "additional_swap_count":
                 row[col] = info.get(col, info.get("swap_count", None))
             elif col == "original_num_qubits":
@@ -404,7 +407,9 @@ if __name__ == "__main__":
             "swap_count",
             "original_cnot_count_all",
             "routed_cnot_equiv_count",
-            "additional_cnot_equiv_from_swap",
+            "additional_cnot_equiv_from_routing",
+            "derived_swap_equiv_from_2q",
+            "routed_swap_raw_count",
             "routing_time_sec",
             "evaluating_router",
         ]
@@ -419,7 +424,9 @@ if __name__ == "__main__":
         "baseline_score",
         "original_cnot_count_all",
         "routed_cnot_equiv_count",
-        "additional_cnot_equiv_from_swap",
+        "additional_cnot_equiv_from_routing",
+        "derived_swap_equiv_from_2q",
+        "routed_swap_raw_count",
         "routing_time_sec",
     ]].mean(numeric_only=True))
     print(f"Saved full metrics to {out}")
