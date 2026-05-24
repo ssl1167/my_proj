@@ -10,8 +10,6 @@ from .config import ModelConfig
 
 
 class ResidualGraphEncoder(nn.Module):
-    """Residual message passing over a dense, normalized adjacency matrix."""
-
     def __init__(self, in_dim: int, hidden_dim: int, num_layers: int, dropout: float) -> None:
         super().__init__()
         self.input_proj = nn.Linear(in_dim, hidden_dim)
@@ -68,8 +66,6 @@ class ResidualGraphEncoder(nn.Module):
 
 
 class ConditionalPlacementContext(nn.Module):
-    """Vectorized attention over already placed (logic, physical) pairs."""
-
     def __init__(self, hidden_dim: int, out_dim: int) -> None:
         super().__init__()
         self.key_proj = nn.Linear(hidden_dim * 2, hidden_dim)
@@ -85,7 +81,6 @@ class ConditionalPlacementContext(nn.Module):
         pair_states: torch.Tensor,
         placed_logic_mask: torch.Tensor,
     ) -> torch.Tensor:
-        # pair_states: [B, N_logic, 2H], mask: [B, N_logic]
         keys = self.key_proj(pair_states)
         vals = self.val_proj(pair_states)
         query = self.query_proj(query_logic).unsqueeze(1)
@@ -101,8 +96,6 @@ class ConditionalPlacementContext(nn.Module):
 
 
 class MappingSummary(nn.Module):
-    """高级自注意力布局聚合器：通过可学习的注意力评级机制，彻底消除中后期特征稀释问题。"""
-
     def __init__(self, hidden_dim: int) -> None:
         super().__init__()
         self.pair_proj = nn.Sequential(
@@ -111,7 +104,6 @@ class MappingSummary(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
         )
-        # 显式构造瓶颈注意力评分网络
         self.attn_score = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.Tanh(),
@@ -120,24 +112,15 @@ class MappingSummary(nn.Module):
         self.hidden_dim = hidden_dim
 
     def forward(self, pair_states: torch.Tensor, placed_logic_mask: torch.Tensor) -> torch.Tensor:
-        # pair_states: [B, N_logic, 2H], placed_logic_mask: [B, N_logic]
-        pair_emb = self.pair_proj(pair_states)  # [B, N_logic, H]
-        
-        # 1. 计算每个已放置对的危险/重要性得分
-        scores = self.attn_score(pair_emb).squeeze(-1)  # [B, N_logic]
-        
-        # 2. 对未放置的逻辑节点执行极值掩码 (-1e9)，阻止其参与 Softmax
+        pair_emb = self.pair_proj(pair_states) 
+        scores = self.attn_score(pair_emb).squeeze(-1) 
         scores = scores.masked_fill(placed_logic_mask <= 0.5, -1e9)
+        attn_weights = torch.softmax(scores, dim=-1) 
         
-        # 3. 计算 Softmax 概率分布。此时如果某一步放置极差，其 score 会极高，并在分布中占据主导地位
-        attn_weights = torch.softmax(scores, dim=-1)  # [B, N_logic]
-        
-        # 处理全域未放置的 Episode 初始状态边界
-        no_pair = placed_logic_mask.sum(dim=1, keepdim=True) <= 0.5  # [B, 1]
+        no_pair = placed_logic_mask.sum(dim=1, keepdim=True) <= 0.5
         attn_weights = torch.where(no_pair, torch.zeros_like(attn_weights), attn_weights)
         
-        # 4. 批次矩阵乘法 (BMM) 提取高内聚的全局布局特征向量
-        summary = torch.bmm(attn_weights.unsqueeze(1), pair_emb).squeeze(1)  # [B, H]
+        summary = torch.bmm(attn_weights.unsqueeze(1), pair_emb).squeeze(1)
         return torch.where(no_pair, torch.zeros_like(summary), summary)
 
 
@@ -157,16 +140,12 @@ class GraphAwarePolicy(nn.Module):
         self.candidate_feat_dim = candidate_feat_dim
         self.logical_candidate_feat_dim = logical_candidate_feat_dim
 
-        # --- 核心修改：升维通道设计 ---
-        # 逻辑图输入特征维度 = 自身静态特征 + 1(放置状态位) + 映射目标的物理节点特征维度
         dynamic_logic_in = logic_feat_dim + 1 + phys_feat_dim
-        # 物理图输入特征维度 = 自身静态特征 + 1(占用状态位) + 承载目标的逻辑节点特征维度
         dynamic_phys_in = phys_feat_dim + 1 + logic_feat_dim
 
         self.logic_encoder = ResidualGraphEncoder(dynamic_logic_in, cfg.hidden_dim, cfg.graph_layers, cfg.dropout)
         self.phys_encoder = ResidualGraphEncoder(dynamic_phys_in, cfg.hidden_dim, cfg.graph_layers, cfg.dropout)
         
-        # 以下保持原样，无需改动，完美的下游尺寸兼容性
         self.context = ConditionalPlacementContext(cfg.hidden_dim, cfg.placement_dim)
         self.mapping_summary = MappingSummary(cfg.hidden_dim)
 
@@ -285,50 +264,36 @@ class GraphAwarePolicy(nn.Module):
         else:
             phys_node_mask = phys_node_mask.float()
 
-        # ==================== 核心修改：跨图动态特征注入引擎 ====================
         placed_logic_mask = ((mapping >= 0).float() * logic_node_mask).float()
         safe_mapping = mapping.clamp(min=0).long()
 
-        # 1. 动态自适应组装逻辑图节点特征 (Logic -> Mapped Phys Feats)
-        # 提取绑定的物理特征通道
         gathered_phys_x = torch.gather(
             phys_x,
             dim=1,
             index=safe_mapping.unsqueeze(-1).expand(-1, -1, phys_x.shape[-1])
         )
-        # 清空未放置节点的干扰信号
         gathered_phys_x = gathered_phys_x * placed_logic_mask.unsqueeze(-1)
-        # 张量拼接：[B, N_logic, logic_feat_dim + 1 + phys_feat_dim]
         logic_x_dynamic = torch.cat([
             logic_x,
             placed_logic_mask.unsqueeze(-1),
             gathered_phys_x
         ], dim=-1)
 
-        # 2. 动态自适应组装物理图节点特征 (Phys -> Hosted Logic Feats)
-        # 通过 one_hot 构建精准的逻辑-物理双射映射关联张量矩阵
         mapping_one_hot = F.one_hot(safe_mapping, num_classes=phys_x.shape[1]).float()
         mapping_one_hot = mapping_one_hot * placed_logic_mask.unsqueeze(-1)
-        # 利用高效的批次矩阵乘法转置，一次性反向聚集映射到各物理节点的逻辑特征
-        # [B, N_phys, N_logic] x [B, N_logic, logic_feat_dim] -> [B, N_phys, logic_feat_dim]
         gathered_logic_x = torch.bmm(mapping_one_hot.transpose(1, 2), logic_x)
-        # 张量拼接：[B, N_phys, phys_feat_dim + 1 + logic_feat_dim]
         phys_x_dynamic = torch.cat([
             phys_x,
             used_phys.unsqueeze(-1),
             gathered_logic_x
         ], dim=-1)
-        # ======================================================================
 
-        # 让 GNN 在运行多层 Message Passing 时，自发感应当前的图映射状态流
         logic_emb = self.logic_encoder(logic_x_dynamic, logic_adj, logic_node_mask)
         phys_emb = self.phys_encoder(phys_x_dynamic, phys_adj, phys_node_mask)
         
-        # 下游计算流完全保持原样，GNN 输出的 hidden_dim 完美向后兼容
         logical_feat_emb = self.logical_candidate_proj(logical_candidate_features)
         pair_states = self._mapped_pair_states(logic_emb, phys_emb, mapping, placed_logic_mask)
         
-        # 激活全新的注意力门控池化机制
         mapping_summary = self.mapping_summary(pair_states, placed_logic_mask)
         
         global_logic = self._masked_mean(logic_emb, logic_node_mask)
@@ -481,29 +446,28 @@ class GraphAwarePolicy(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         enc = self._prepare_inputs(batch)
         
-        # 1. 动态解析批次动作空间的决策类型
-        is_fixed_order = "is_fixed_order" in batch and batch["is_fixed_order"][0].item() > 0
+        # 核心修复 4：增加多模式批次一致性断言，避免混入了脏数据
+        if "is_fixed_order" in batch:
+            assert torch.all(batch["is_fixed_order"] == batch["is_fixed_order"][0]), "Batch mixes fixed_order and hierarchical modes."
+            is_fixed_order = batch["is_fixed_order"][0].item() > 0
+        else:
+            is_fixed_order = False
 
         if is_fixed_order:
-            # ==================== 核心修改：策略评估梯度流截断 ====================
-            # 用 zeros 截断 logical_head 的反向传播路径，阻止无效的随机梯度噪声污染网络
             logical_logits = torch.zeros_like(batch["logical_action_mask"])
             logical_logprob = torch.zeros_like(action_logical, dtype=torch.float32)
             logical_entropy = torch.zeros_like(action_logical, dtype=torch.float32)
         else:
-            # 正常的双层联合分布评估
             logical_logits = self._logical_logits(enc)
             logical_dist = torch.distributions.Categorical(logits=logical_logits)
-            logical_logprob = d = logical_dist.log_prob(action_logical.long())
+            logical_logprob = logical_dist.log_prob(action_logical.long())
             logical_entropy = logical_dist.entropy()
 
-        # 2. 严格并行评估条件下的物理位置决策质量
         physical_logits = self._physical_logits(enc, action_logical.long(), use_physical_prior=use_physical_prior)
         physical_dist = torch.distributions.Categorical(logits=physical_logits)
         physical_logprob = physical_dist.log_prob(action_physical.long())
         physical_entropy = physical_dist.entropy()
 
-        # 3. 联合优势估计组合
         entropy = logical_entropy + physical_entropy
         value = self._value(enc)
 
@@ -525,25 +489,23 @@ class GraphAwarePolicy(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         enc = self._prepare_inputs(batch)
         
-        # 1. 动态感知当前运行模式（完美兼容单步推断与 DataLoader 批次张量）
-        is_fixed_order = "is_fixed_order" in batch and batch["is_fixed_order"][0].item() > 0
+        # 核心修复 4：同理增加批次验证保护机制
+        if "is_fixed_order" in batch:
+            assert torch.all(batch["is_fixed_order"] == batch["is_fixed_order"][0]), "Batch mixes fixed_order and hierarchical modes."
+            is_fixed_order = batch["is_fixed_order"][0].item() > 0
+        else:
+            is_fixed_order = False
 
         if is_fixed_order:
-            # ==================== 核心修改：固定顺序模式短路分支 ====================
-            # 直接提取环境锁定的当前逻辑比特，免除 logits 前向流与采样流开销
             logical_action = batch["current_logical_idx"].long()
-            # 确定性决策的概率对数值与信息熵在物理和数学意义上严格为 0
             logical_logprob = torch.zeros_like(batch["progress"].squeeze(-1))
-            # 构造全零矩阵用于占位，保持输出字典的 Schema 完全对称与下游兼容
             logical_logits = torch.zeros_like(batch["logical_action_mask"])
         else:
-            # 分层层次化联合决策分支（保持原样逻辑）
             logical_logits = self._logical_logits(enc)
             logical_dist = torch.distributions.Categorical(logits=logical_logits)
             logical_action = torch.argmax(logical_logits, dim=-1) if deterministic else logical_dist.sample()
             logical_logprob = logical_dist.log_prob(logical_action)
 
-        # 2. 物理图位置选择：输入当前的逻辑节点特征，计算条件物理分布（两模式通用）
         physical_logits = self._physical_logits(enc, logical_action, use_physical_prior=use_physical_prior)
         physical_dist = torch.distributions.Categorical(logits=physical_logits)
         physical_action = torch.argmax(physical_logits, dim=-1) if deterministic else physical_dist.sample()
@@ -554,7 +516,7 @@ class GraphAwarePolicy(nn.Module):
         return {
             "action_logical": logical_action,
             "action_physical": physical_action,
-            "logprob": logical_logprob + physical_logprob,  # 固定模式下等价于 pure physical_logprob
+            "logprob": logical_logprob + physical_logprob,
             "logical_logprob": logical_logprob,
             "physical_logprob": physical_logprob,
             "value": value,
