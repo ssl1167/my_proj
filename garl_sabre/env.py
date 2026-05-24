@@ -10,6 +10,7 @@ from qiskit import QuantumCircuit, transpile
 from .circuit_features import LogicGraphData, build_logic_graph
 from .config import EnvConfig, RewardConfig
 from .heuristics import dense_layout, trivial_layout
+# 同步引入 _basis_with_swap
 from .qiskit_runner import _build_metrics, evaluate_layout_metrics, objective_from_metrics, prepare_basis_circuit
 from .topology import HardwareTopology, adjacency_with_self_loops
 
@@ -39,12 +40,12 @@ class InitialLayoutEnv:
         self.front_pair_mask: Optional[np.ndarray] = None
         self.critical_pair_mask: Optional[np.ndarray] = None
 
-        # --- 鏍稿績淇敼锛氬紩鍏ユ湁鐘舵€佽繍琛屾ā寮忥紙涓氱晫鏍囧噯 RL 鐜娴佽璁★級 ---
-        self.is_training: bool = True  # 榛樿婵€娲绘棤鎹熸帰绱㈣缁冩ā寮?
+        # --- 核心修改：引入有状态运行模式（业界标准 RL 环境流设计） ---
+        self.is_training: bool = True  # 默认激活无损探索训练模式
         finite_d = self.hardware.dist[self.hardware.dist < 1e8]
         self.max_dist = float(max(1.0, finite_d.max() if finite_d.size > 0 else 1.0))
 
-        # ==================== 鏍稿績淇敼 1: 鎷撴墤鑷€傚簲鍥捐鐔垫潈铻嶅悎寮曟搸 ====================
+        # ==================== 核心修改 1: 拓扑自适应图论熵权融合引擎 ====================
         raw_topo_feats = self.hardware.node_features[:, :4].astype(np.float32)
         num_nodes = raw_topo_feats.shape[0]
         if num_nodes > 1:
@@ -77,8 +78,30 @@ class InitialLayoutEnv:
     def _use_physical_prior(self) -> bool:
         return bool(getattr(self.env_cfg, "use_physical_prior", True))
 
-    def _compute_baseline_metrics(self) -> bool:
-        return True  # 瀛︽湳绾ц瘎娴嬫祦涓己鍒舵縺娲诲熀绾胯绠?
+    def _compute_baseline(self) -> tuple[Optional[float], str, Dict[str, float]]:
+        """Compute the configured external baseline metrics."""
+        assert self.circuit is not None and self.logic is not None
+        mode = self.env_cfg.baseline_mode
+        if mode == "none":
+            return None, "none", {}
+
+        # 1. 学术级工业标杆 Qiskit-Sabre 分数
+        if mode == "sabre":
+            prepared = prepare_basis_circuit(self.circuit, self.env_cfg)
+            sabre_routed_circ = transpile(
+                prepared,
+                coupling_map=self.hardware.coupling_map,
+                # Sabre基线也同样使用 _basis_with_swap() 来保证提取到 pure swap
+                basis_gates=_basis_with_swap(self.env_cfg),
+                layout_method="sabre",
+                routing_method="sabre",
+                optimization_level=0,
+                seed_transpiler=self.env_cfg.sabre_seed
+            )
+            sabre_metrics = _build_metrics(prepared, sabre_routed_circ, 0.0, "qiskit_sabre")
+            sabre_score = float(objective_from_metrics(sabre_metrics, self.reward_cfg, self.env_cfg))
+            return sabre_score, "sabre", sabre_metrics
+
     def _build_physical_weighted_adj(self) -> np.ndarray:
         n = self.hardware.num_qubits
         adj = np.zeros((n, n), dtype=np.float32)
@@ -106,7 +129,7 @@ class InitialLayoutEnv:
         deg = np.maximum(adj.sum(axis=1, keepdims=True), 1e-8)
         return (adj / deg).astype(np.float32)
 
-    # 鎵╁ぇ鍙傛暟绛惧悕锛屾帴鏀跺閮ㄧ紦瀛樼殑 baseline_info
+    # 扩大参数签名，接收外部缓存的 baseline_info
     def reset(self, circuit: QuantumCircuit, is_training: Optional[bool] = None, logic_graph: Optional[LogicGraphData] = None, baseline_info: Optional[Tuple] = None) -> Dict:
         if circuit.num_qubits > self.hardware.num_qubits:
             raise ValueError(f"Circuit has {circuit.num_qubits} qubits, but hardware only has {self.hardware.num_qubits}.")
@@ -116,7 +139,7 @@ class InitialLayoutEnv:
 
         self.circuit = circuit.copy()
         
-        # --- 鏍稿績淇敼 3锛氫緷璧栨敞鍏ヤ紭鍏堛€傚鏈夌紦瀛樺浘鍒欐瀬閫熸寕杞斤紝鍚﹀垯鎵ц鍥為€€璁＄畻 ---
+        # --- 核心修改 3：依赖注入优先。如有缓存图则极速挂载，否则执行回退计算 ---
         if logic_graph is not None:
             self.logic = logic_graph
         else:
@@ -124,7 +147,7 @@ class InitialLayoutEnv:
             
         self.mapping_log_to_phys = np.full(self.logic.num_qubits, -1, dtype=np.int64)
         
-        # ... 鍚庣画鍏朵綑浠ｇ爜淇濇寔瀹屽叏涓嶅彉 ...
+        # ... 后续其余代码保持完全不变 ...
         self.used_phys = np.zeros(self.hardware.num_qubits, dtype=np.float32)
         self.step_idx = 0
         self.logical_order = self._build_logical_order()
@@ -138,7 +161,7 @@ class InitialLayoutEnv:
         else:
             self.baseline_score, self.baseline_name, self.baseline_metrics = self._compute_baseline()
         
-        # 寮哄埗灏嗗鍔卞嚱鏁扮殑鍙嶄簨瀹炲弬鐓х墿鍒嗘瘝涓庝綘鎸囧畾鐨勫崟涓€ baseline_mode 娣卞害閿佹
+        # 强制将奖励函数的反事实参照物分母与你指定的单一 baseline_mode 深度锁死
         self.reward_anchor_score = self.baseline_score if self.baseline_score is not None else 1.0
         if self.reward_anchor_score <= 1e-5:
             fast_layout = dense_layout(self.logic, self.hardware)
@@ -474,7 +497,7 @@ class InitialLayoutEnv:
         reward += 0.05 * cand["executable_frontier_ratio"]
         reward += 0.03 * cand["free_neighbor_ratio"]
         
-        # ==================== 鏍稿績淇敼 3: 鍙屾洸姝ｅ垏骞虫粦婵€娲伙紝鏇挎崲纭鍓?====================
+        # ==================== 核心修改 3: 双曲正切平滑激活，替换硬裁剪 ====================
         reward = float(0.35 * np.tanh(reward / 0.25))
         # ==============================================================================
 
@@ -514,19 +537,24 @@ class InitialLayoutEnv:
                 basis_gates=self.env_cfg.basis_gates,
                 layout_method="sabre",
                 routing_method="sabre",
-                optimization_level=self.env_cfg.optimization_level,
+                optimization_level=0, # 修改为 0，保证基线评估对齐纯路由代价
                 seed_transpiler=self.env_cfg.sabre_seed
             )
             sabre_metrics = _build_metrics(prepared, sabre_routed_circ, 0.0, "qiskit_sabre")
             sabre_score = float(objective_from_metrics(sabre_metrics, self.reward_cfg, self.env_cfg))
             return sabre_score, "sabre", sabre_metrics
 
-        # 2. 淇濈暀鍘熸湁鐨勫父瑙勭揣鍑戝拰寰急鍩虹嚎鍒嗘敮锛堜粎闄愰潪sabre鐘舵€侊級
+        # 2. 保留原有的常规紧凑和微弱基线分支（仅限非sabre状态）
         candidates: list[tuple[str, list[int]]] = []
         if mode == "trivial":
             candidates.append(("trivial", trivial_layout(self.logic.num_qubits)))
-        if mode == "dense":
+        elif mode == "dense":
             candidates.append(("dense", dense_layout(self.logic, self.hardware)))
+        elif mode == "hybrid":
+            candidates.append(("trivial", trivial_layout(self.logic.num_qubits)))
+            candidates.append(("dense", dense_layout(self.logic, self.hardware)))
+        else:
+            raise ValueError(f"Unsupported baseline_mode: {mode}")
 
         best_name = "none"
         best_metrics: Dict[str, float] = {}
@@ -588,14 +616,14 @@ class InitialLayoutEnv:
         if done:
             layout = self.mapping_log_to_phys.tolist()
             
-            # ==================== 鏍稿績淇敼 4: 婵€娲诲弻鍚庣鍔ㄦ€佽嚜閫傚簲缁堢粨鍥炴姤瀵归綈鍏紡 ====================
+            # ==================== 核心修改 4: 激活双后端动态自适应终结回报对齐公式 ====================
             metrics = self._execute_dual_backend_routing(layout)
             terminal_objective = float(objective_from_metrics(metrics, self.reward_cfg, self.env_cfg))
             
-            # 璁＄畻褰撳墠 RL 缁撴灉鐩告瘮鍥哄畾澶栭儴鍩虹嚎鐨勭浉瀵逛紭鍖栨彁鍗囩孩鍒╃巼
+            # 计算当前 RL 结果相比固定外部基线的相对优化提升红利率
             relative_improvement = (self.reward_anchor_score - terminal_objective) / self.reward_anchor_score
             
-            # 浣跨敤绾挎€х缉鏀惧疄鐜扮粷瀵圭殑 MDP 浠峰€煎榻愶紝鎷掔粷 Reward Hacking 
+            # 使用线性缩放实现绝对的 MDP 价值对齐，拒绝 Reward Hacking 
             num_qubits_factor = float(self.logic.num_qubits)  
 
             terminal_reward = float(self.reward_cfg.terminal_scale * relative_improvement * num_qubits_factor)
