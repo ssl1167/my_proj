@@ -7,9 +7,10 @@ from typing import Dict, List, Tuple
 
 import networkx as nx
 import numpy as np
-from qiskit import QuantumCircuit
+from qiskit import QuantumCircuit, transpile
 
 from .topology import adjacency_with_self_loops
+from qiskit.converters import circuit_to_dag
 
 
 @dataclass
@@ -23,56 +24,40 @@ class LogicGraphData:
     placement_order: List[int]
     critical_edges: List[Tuple[int, int]]
     front_pairs: List[Tuple[int, int]]
-    # Continuous criticality matrix is added for downstream use. Existing code can
-    # continue to use critical_edges/front_pairs without modification.
     critical_score: np.ndarray = field(default_factory=lambda: np.zeros((0, 0), dtype=np.float32))
 
 
-from qiskit.converters import circuit_to_dag
-
 def _layerize_two_qubit_ops(circuit: QuantumCircuit) -> List[List[Tuple[int, int, str]]]:
-    """使用 Qiskit 官方的高性能 DAG 依赖追踪引擎，精准提取纯双量子比特门的基准并发执行层。
-    
-    该架构通过深度克隆骨架并预先剔除全线单量子比特门噪声，消除了非耦合指令带来的无效时序拉伸，
-    确保 front_pairs 和 lookahead_window 的统计口径与真实的量子解耦流（如 Sabre 动态 Frontier）绝对重合。
-    """
-    # 1. 高内聚克隆原线路骨架（完美兼容 Qiskit 0.44+ / 1.0+ 的 Flat Qubits 及 Named Registers 机制）
     two_q_circ = circuit.copy()
-    two_q_circ.data.clear()  # 使用高效的原位清空，保留底层寄存器结构
+    two_q_circ.data.clear()  
     
-    # 2. 仅过滤保留具有拓扑约束的双量子比特操作，彻底解耦单比特门干扰
     for inst in circuit.data:
-        # 终极全版本兼容解析：阻断渴求求值陷阱，安全剥离算子与比特位
         if hasattr(inst, "operation"):
-            # Qiskit 1.0+ 标准 CircuitInstruction 对象结构
             op = inst.operation
             qargs = inst.qubits
             cargs = inst.clbits
         else:
-            # Qiskit 0.x 传统 Tuple 结构
             op = inst[0]
             qargs = inst[1]
             cargs = inst[2] if len(inst) > 2 else []
 
         if len(qargs) == 2:
-            two_q_circ.append(op, qargs=qargs, cargs=cargs)
+            # 核心修复 3：统一用整数 index 桥接跨 circuit 的对象绑定，杜绝版本兼容性 Bug
+            q_mapped = [two_q_circ.qubits[circuit.find_bit(q).index] for q in qargs]
+            c_mapped = [two_q_circ.clbits[circuit.find_bit(c).index] for c in cargs] if cargs else []
+            op_to_append = op.copy() if hasattr(op, "copy") else op
+            two_q_circ.append(op_to_append, qargs=q_mapped, cargs=c_mapped)
             
-    # 3. 将去噪线路编译为正式的有向无环图 (DAGCircuit)，由底层的 C++ 或优化图论引擎接管依赖追踪
     dag = circuit_to_dag(two_q_circ)
     layers: List[List[Tuple[int, int, str]]] = []
     
-    # 4. 迭代遍历 DAG 的最长路径拓扑层 (ASAP Generations)，提取真实的并发执行时间片
     for layer_dict in dag.layers():
         layer_dag = layer_dict["graph"]
         layer_ops: List[Tuple[int, int, str]] = []
         
-        # 提取当前并发层内的算子节点
         for node in layer_dag.op_nodes():
-            # 严谨映射：利用原线路的全局查找，将节点内的抽象 Qubit 实例映射为全局单调递增的绝对整数索引值
             q0 = circuit.find_bit(node.qargs[0]).index
             q1 = circuit.find_bit(node.qargs[1]).index
-            
-            # 统一记录操作名（如 'cx', 'cz', 'ecr'）
             op_name = getattr(node.op, "name", node.name)
             layer_ops.append((q0, q1, op_name))
             
@@ -80,7 +65,6 @@ def _layerize_two_qubit_ops(circuit: QuantumCircuit) -> List[List[Tuple[int, int
             layers.append(layer_ops)
             
     return layers
-
 
 
 def _normalize_dense_adj(adj: np.ndarray) -> np.ndarray:
@@ -114,12 +98,6 @@ def _select_critical_edges(
     first_layer: Dict[Tuple[int, int], int],
     freq: Dict[Tuple[int, int], float],
 ) -> List[Tuple[int, int]]:
-    """Choose a stable subset of critical edges.
-
-    The previous implementation used a hard fixed percentage cut. Here we keep a
-    score-adaptive subset: all edges above mean+0.25*std, with a small top-k
-    fallback to avoid empty critical sets on tiny graphs.
-    """
     if not critical_score_map:
         return []
 
@@ -136,12 +114,18 @@ def _select_critical_edges(
     if selected:
         return selected
 
-    # Small-graph fallback: keep a modest top subset instead of a fixed 35% cut.
     keep = max(1, min(len(ranked_edges), ceil(np.sqrt(len(ranked_edges)))))
     return [edge for edge, _ in ranked_edges[:keep]]
 
 
 def build_logic_graph(circuit: QuantumCircuit, critical_window: int = 8, lookahead_window: int = 16) -> LogicGraphData:
+    # 核心修复 2：在特征建图之前强制解构出标准通用基，让 CCX 等多控门的内在依赖完全显露
+    circuit = transpile(
+        circuit,
+        basis_gates=["rz", "sx", "x", "cx"],
+        optimization_level=0,
+    )
+    
     n = circuit.num_qubits
     layers = _layerize_two_qubit_ops(circuit)
 
@@ -169,8 +153,6 @@ def build_logic_graph(circuit: QuantumCircuit, critical_window: int = 8, lookahe
     early_count = defaultdict(float)
     layer_positions: Dict[Tuple[int, int], List[int]] = defaultdict(list)
 
-    # Make critical_window actually effective. It controls how many approximate
-    # early layers contribute to front/frontier statistics.
     front_layer_count = min(max(int(critical_window), 1), len(layers))
     lookahead_layer_count = min(max(int(lookahead_window), front_layer_count), len(layers))
 
@@ -246,9 +228,6 @@ def build_logic_graph(circuit: QuantumCircuit, critical_window: int = 8, lookahe
 
     weighted_degree = np.array([sum(g[u][v]["weight"] for v in g.neighbors(u)) for u in range(n)], dtype=np.float32)
 
-    # PageRank is kept because it still provides a useful global signal, but it is
-    # computed only once per graph construction. Later optimization should cache the
-    # whole LogicGraphData instead of repeatedly rebuilding graphs in env.reset().
     pagerank = (
         np.array(list(nx.pagerank(g, weight="weight").values()), dtype=np.float32)
         if g.number_of_edges() > 0
@@ -280,7 +259,6 @@ def build_logic_graph(circuit: QuantumCircuit, critical_window: int = 8, lookahe
 
     critical_edges = _select_critical_edges(critical_score_map, first_layer, freq)
 
-    # Build a slightly wider approximate front instead of using only the first layer.
     front_pairs: List[Tuple[int, int]] = []
     seen = set()
     for layer_ops in layers[:front_layer_count]:
