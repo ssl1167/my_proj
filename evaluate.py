@@ -19,19 +19,40 @@ from garl_sabre.utils import obs_to_torch
 
 EVAL_COLUMNS = [
     "reward",
-    "swap_count",
     "routing_score",
     "terminal_objective",
     "terminal_reward",
     "baseline_score",
     "baseline_name",
+    "additional_cnot_count",
+    "paper_additional_cnot_count",
+    "physical_cnot_count",
+    "logical_cnot_count",
+    "active_logical_qubits",
+    "inserted_swap_count",
+    "inserted_bridge_count",
+    "bridge_count_source",
+    "swap_count",
+    "swap_count_source",
+    "additional_swap_count",
     "routing_time_sec",
+    "runtime",
+    "evaluating_router",
+    "metric_protocol",
+    "input_num_qubits",
+    "input_gate_count_all",
+    "input_1q_count_all",
+    "input_2q_count_all",
+    "input_cnot_count_all",
+    "input_swap_raw_count",
+    "input_depth",
     "original_num_qubits",
     "original_gate_count_all",
     "original_1q_count_all",
     "original_2q_count_all",
     "original_cnot_count_all",
     "original_swap_raw_count",
+    "original_cnot_equiv_count",
     "original_depth",
     "routed_gate_count_all",
     "routed_1q_count_all",
@@ -44,11 +65,26 @@ EVAL_COLUMNS = [
     "additional_1q_total",
     "additional_2q_total",
     "additional_cx_total",
-    "additional_swap_raw",
-    "additional_cnot_equiv_from_routing",
-    "derived_swap_equiv_from_2q",
+    "additional_cx_total_nonnegative",
+    "cnot_equiv_overhead",
     "depth_overhead",
+]
+
+PAPER_COLUMNS = [
+    "family",
+    "name",
+    "num_qubits",
+    "initial_mapper",
+    "mode",
+    "logical_cnot_count",
+    "active_logical_qubits",
+    "inserted_swap_count",
+    "inserted_bridge_count",
+    "additional_cnot_count",
+    "physical_cnot_count",
+    "routing_time_sec",
     "evaluating_router",
+    "metric_protocol",
 ]
 
 
@@ -85,9 +121,11 @@ def build_model_from_env(env, sample_circuit, device, state_dict):
 
 
 def _metric_value(info: Dict, metric: str) -> Optional[float]:
-    if metric != "swap_count":
+    if metric not in {"additional_cnot_count", "swap_count", "routing_score"}:
         raise ValueError(f"Unknown eval metric: {metric}")
-    val = info.get("swap_count", None)
+    val = info.get(metric, None)
+    if val is None and metric == "additional_cnot_count":
+        val = info.get("routing_score", None)
     return None if val is None else float(val)
 
 
@@ -101,8 +139,57 @@ def _is_better(candidate_info: Dict, best_info: Dict, metric: str) -> bool:
     return cand < best
 
 
-def run_episode(model, env, circuit, device, deterministic: bool = True,
-                use_physical_prior: bool = True, disable_candidate_ranking_eval: bool = False):
+def _as_float(info: Dict, key: str) -> Optional[float]:
+    val = info.get(key, None)
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _check_metric_consistency(info: Dict, name: str, atol: float = 1e-6) -> None:
+    logical = _as_float(info, "logical_cnot_count")
+    physical = _as_float(info, "physical_cnot_count")
+    additional = _as_float(info, "additional_cnot_count")
+    if logical is not None and physical is not None and additional is not None:
+        expected_physical = logical + additional
+        if abs(expected_physical - physical) > atol:
+            raise ValueError(f"Metric inconsistency for {name}: physical_cnot_count={physical}, expected {expected_physical}.")
+
+    paper_add = _as_float(info, "paper_additional_cnot_count")
+    if paper_add is not None and additional is not None and abs(paper_add - additional) > atol:
+        raise ValueError(f"Metric inconsistency for {name}: paper_additional_cnot_count={paper_add}, additional_cnot_count={additional}.")
+
+    inserted_swap = _as_float(info, "inserted_swap_count")
+    additional_swap = _as_float(info, "additional_swap_count")
+    if inserted_swap is not None and additional_swap is not None and abs(inserted_swap - additional_swap) > atol:
+        raise ValueError(f"Metric inconsistency for {name}: inserted_swap_count={inserted_swap}, additional_swap_count={additional_swap}.")
+
+    additional_cx_nn = _as_float(info, "additional_cx_total_nonnegative")
+    if additional is not None and inserted_swap is not None and additional_cx_nn is not None:
+        expected_additional = max(additional_cx_nn, 3.0 * inserted_swap)
+        if abs(additional - expected_additional) > atol:
+            raise ValueError(
+                f"Metric inconsistency for {name}: additional_cnot_count={additional}, "
+                f"expected max(additional_cx_total_nonnegative={additional_cx_nn}, 3*inserted_swap_count={3.0 * inserted_swap}) = {expected_additional}."
+            )
+
+    routed_2q = _as_float(info, "routed_2q_count_all")
+    original_2q = _as_float(info, "original_2q_count_all")
+    reported_2q = _as_float(info, "additional_2q_total")
+    if routed_2q is not None and original_2q is not None and reported_2q is not None and abs((routed_2q - original_2q) - reported_2q) > atol:
+        raise ValueError(f"Metric inconsistency for {name}: additional_2q_total={reported_2q}, expected {routed_2q - original_2q}.")
+
+    routed_depth = _as_float(info, "routed_depth")
+    original_depth = _as_float(info, "original_depth")
+    depth_overhead = _as_float(info, "depth_overhead")
+    if routed_depth is not None and original_depth is not None and depth_overhead is not None and abs((routed_depth - original_depth) - depth_overhead) > atol:
+        raise ValueError(f"Metric inconsistency for {name}: depth_overhead={depth_overhead}, expected {routed_depth - original_depth}.")
+
+
+def run_episode(model, env, circuit, device, deterministic: bool = True, use_physical_prior: bool = True, disable_candidate_ranking_eval: bool = False):
     old_ranking = env.env_cfg.use_candidate_ranking
     if disable_candidate_ranking_eval:
         env.env_cfg.use_candidate_ranking = False
@@ -110,7 +197,7 @@ def run_episode(model, env, circuit, device, deterministic: bool = True,
         obs = env.reset(circuit, is_training=False)
         done = False
         total_reward = 0.0
-        info = {}
+        info: Dict = {}
         with torch.no_grad():
             while not done:
                 batch = obs_to_torch(obs, device)
@@ -149,15 +236,14 @@ def run_beam_episode(
     beam_reward_weight: float = 0.20,
     disable_candidate_ranking_eval: bool = True,
     use_physical_prior: bool = True,
-    choose_metric: str = "swap_count",
+    choose_metric: str = "additional_cnot_count",
 ):
     old_ranking = env.env_cfg.use_candidate_ranking
     if disable_candidate_ranking_eval:
         env.env_cfg.use_candidate_ranking = False
     try:
         env.reset(circuit, is_training=False)
-        beams = [SearchNode(snapshot=env.snapshot(), logprob=0.0, total_reward=0.0, done=False,
-                            info={"beam_reward_weight": beam_reward_weight}, mode="beam")]
+        beams = [SearchNode(snapshot=env.snapshot(), logprob=0.0, total_reward=0.0, done=False, info={"beam_reward_weight": beam_reward_weight}, mode="beam")]
         completed: List[SearchNode] = []
         with torch.no_grad():
             for _ in range(env.logic.num_qubits if env.logic is not None else 0):
@@ -172,13 +258,11 @@ def run_beam_episode(
                     step_logits = model.get_step_logits(batch)
                     logical_logits = step_logits["logical_logits"][0]
                     logical_logprob = torch.log_softmax(logical_logits, dim=-1)
-                    logical_choices = _topk_valid(logical_logits, logic_branch)
-                    for logical_q in logical_choices:
+                    for logical_q in _topk_valid(logical_logits, logic_branch):
                         logical_q_t = torch.tensor([logical_q], dtype=torch.long, device=device)
                         physical_logits = model.get_physical_logits(step_logits, logical_q_t, use_physical_prior=use_physical_prior)[0]
                         physical_logprob = torch.log_softmax(physical_logits, dim=-1)
-                        physical_choices = _topk_valid(physical_logits, physical_branch)
-                        for phys_q in physical_choices:
+                        for phys_q in _topk_valid(physical_logits, physical_branch):
                             env.restore(node.snapshot)
                             out = env.step((logical_q, phys_q))
                             child_info = dict(out.info)
@@ -205,10 +289,7 @@ def run_beam_episode(
         if not final_pool:
             raise RuntimeError("Beam search produced no candidates.")
         finished = [n for n in final_pool if _metric_value(n.info, choose_metric) is not None]
-        if finished:
-            best = min(finished, key=lambda x: float(_metric_value(x.info, choose_metric)))
-        else:
-            best = max(final_pool, key=lambda x: x.rank_score)
+        best = min(finished, key=lambda x: float(_metric_value(x.info, choose_metric))) if finished else max(final_pool, key=lambda x: x.rank_score)
         return best.total_reward, best.info
     finally:
         env.env_cfg.use_candidate_ranking = old_ranking
@@ -263,21 +344,21 @@ def _pick_best_candidate(candidates: List[Tuple[float, Dict, str]], metric: str)
     return best_reward, best_info, best_mode
 
 
-if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Evaluate RL initial mapping with unified gate accounting.")
+def main() -> None:
+    p = argparse.ArgumentParser(description="Evaluate RL initial mapping with CNOT-only paper accounting.")
     p.add_argument("--dataset_dir", type=str, default="data/demo")
     p.add_argument("--split", type=str, default="test")
     p.add_argument("--split_manifest", type=str, default="")
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--phys_rows", type=int, default=0)
     p.add_argument("--phys_cols", type=int, default=0)
-    p.add_argument("--topology_mode", type=str, default="heavy_hex", choices=["grid", "bottleneck_grid", "ibm_q20", "heavy_hex"])
+    p.add_argument("--topology_mode", type=str, default="ibm_q20", choices=["grid", "bottleneck_grid", "ibm_q20", "heavy_hex"])
     p.add_argument("--topology_distance", type=int, default=5)
     p.add_argument("--router_backend", type=str, default=None, choices=["qiskit", "tket"])
     p.add_argument("--save_csv", type=str, default="outputs/eval.csv")
     p.add_argument("--paper_csv", type=str, default="")
     p.add_argument("--initial_mapper_label", type=str, default="rl+beam+tabu")
-    p.add_argument("--eval_metric", type=str, default="swap_count", choices=["swap_count"])
+    p.add_argument("--eval_metric", type=str, default="additional_cnot_count", choices=["additional_cnot_count", "routing_score", "swap_count"])
     p.add_argument("--num_rollouts", type=int, default=1)
     p.add_argument("--beam_width", type=int, default=4)
     p.add_argument("--beam_logic_branch", type=int, default=2)
@@ -306,11 +387,13 @@ if __name__ == "__main__":
     env_cfg.topology_distance = args.topology_distance
     if args.router_backend:
         env_cfg.router_backend = args.router_backend
-    print(f"Using router backend: {env_cfg.router_backend}")
 
     hardware = build_hardware_topology(args.phys_rows, args.phys_cols, mode=args.topology_mode, distance=args.topology_distance)
     env = InitialLayoutEnv(hardware, env_cfg, reward_cfg)
-    samples = load_split(args.dataset_dir, args.split, args.split_manifest or None)
+    samples = load_split(args.dataset_dir, args.split, args.split_manifest or None, canonicalize_cnot_only=True)
+    if not samples:
+        raise RuntimeError("Evaluation split is empty.")
+
     model = build_model_from_env(env, samples[0].to_circuit(), device, state if isinstance(state, dict) else {})
     load_result = model.load_state_dict(state["model"] if isinstance(state, dict) and "model" in state else state, strict=False)
     if getattr(load_result, "missing_keys", None) or getattr(load_result, "unexpected_keys", None):
@@ -328,7 +411,10 @@ if __name__ == "__main__":
         candidate_runs: List[Tuple[float, Dict, str]] = []
         if args.beam_width > 1:
             beam_reward, beam_info = run_beam_episode(
-                model, env, circuit, device,
+                model,
+                env,
+                circuit,
+                device,
                 beam_width=args.beam_width,
                 logic_branch=args.beam_logic_branch,
                 physical_branch=args.beam_physical_branch,
@@ -340,20 +426,10 @@ if __name__ == "__main__":
             candidate_runs.append((beam_reward, beam_info, f"beam{args.beam_width}"))
         else:
             if not args.skip_greedy:
-                reward, info = run_episode(
-                    model, env, circuit, device,
-                    deterministic=True,
-                    use_physical_prior=use_physical_prior,
-                    disable_candidate_ranking_eval=disable_candidate_ranking_eval,
-                )
+                reward, info = run_episode(model, env, circuit, device, deterministic=True, use_physical_prior=use_physical_prior, disable_candidate_ranking_eval=disable_candidate_ranking_eval)
                 candidate_runs.append((reward, info, "greedy"))
             for rollout_idx in range(max(0, args.num_rollouts - 1)):
-                cand_reward, cand_info = run_episode(
-                    model, env, circuit, device,
-                    deterministic=False,
-                    use_physical_prior=use_physical_prior,
-                    disable_candidate_ranking_eval=disable_candidate_ranking_eval,
-                )
+                cand_reward, cand_info = run_episode(model, env, circuit, device, deterministic=False, use_physical_prior=use_physical_prior, disable_candidate_ranking_eval=disable_candidate_ranking_eval)
                 candidate_runs.append((cand_reward, cand_info, f"sample_{rollout_idx + 1}"))
 
         if not candidate_runs:
@@ -364,27 +440,16 @@ if __name__ == "__main__":
         if args.tabu_iters > 0:
             mode = f"{mode}_tabu" if info.get("tabu_improved", 0) else mode
 
-        row = {
-            "name": sample.name,
-            "family": sample.family,
-            "num_qubits": sample.num_qubits,
-            "initial_mapper": args.initial_mapper_label,
-            "mode": mode,
-            "reward": float(reward),
-        }
+        _check_metric_consistency(info, sample.name)
+
+        row = {"name": sample.name, "family": sample.family, "num_qubits": sample.num_qubits, "initial_mapper": args.initial_mapper_label, "mode": mode, "reward": float(reward)}
         for col in EVAL_COLUMNS:
             if col == "reward":
                 continue
-            elif col == "routed_swap_count":
-                row[col] = info.get(col, info.get("routed_swap_raw_count", None))
-            elif col == "additional_swap_count":
-                row[col] = info.get(col, info.get("swap_count", None))
-            elif col == "original_num_qubits":
-                row[col] = info.get(col, sample.num_qubits)
             elif col == "routing_time_sec":
                 row[col] = info.get(col, info.get("runtime", None))
             elif col == "evaluating_router":
-                row[col] = info.get(col, "qiskit_sabre")
+                row[col] = info.get(col, getattr(env_cfg, "router_backend", "qiskit"))
             else:
                 row[col] = info.get(col, None)
         row["tabu_improved"] = info.get("tabu_improved", 0)
@@ -398,36 +463,22 @@ if __name__ == "__main__":
 
     paper_path = Path(args.paper_csv or _default_paper_csv_path(args.save_csv))
     paper_path.parent.mkdir(parents=True, exist_ok=True)
-    paper_df = df[
-        [
-            "family",
-            "name",
-            "initial_mapper",
-            "mode",
-            "swap_count",
-            "original_cnot_count_all",
-            "routed_cnot_equiv_count",
-            "additional_cnot_equiv_from_routing",
-            "derived_swap_equiv_from_2q",
-            "routed_swap_raw_count",
-            "routing_time_sec",
-            "evaluating_router",
-        ]
-    ].copy()
-    paper_df.to_csv(paper_path, index=False)
+    existing_cols = [c for c in PAPER_COLUMNS if c in df.columns]
+    df[existing_cols].to_csv(paper_path, index=False)
 
     print(df.groupby("family")[[
         "reward",
-        "swap_count",
-        "terminal_objective",
-        "terminal_reward",
+        "additional_cnot_count",
+        "physical_cnot_count",
+        "logical_cnot_count",
+        "inserted_swap_count",
+        "inserted_bridge_count",
         "baseline_score",
-        "original_cnot_count_all",
-        "routed_cnot_equiv_count",
-        "additional_cnot_equiv_from_routing",
-        "derived_swap_equiv_from_2q",
-        "routed_swap_raw_count",
         "routing_time_sec",
     ]].mean(numeric_only=True))
     print(f"Saved full metrics to {out}")
     print(f"Saved paper-style metrics to {paper_path}")
+
+
+if __name__ == "__main__":
+    main()
