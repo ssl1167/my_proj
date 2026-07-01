@@ -5,11 +5,43 @@ import math
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from qiskit import QuantumCircuit
+from qiskit import QuantumCircuit, transpile
 from qiskit.circuit.library import QAOAAnsatz, TwoLocal, QFT
 from qiskit.quantum_info import SparsePauliOp
+
+from .circuit_features import LogicGraphData, build_logic_graph
+from .config import EnvConfig
+from .qiskit_runner import canonical_cnot_circuit
+
+
+def _instruction_parts(inst):
+    if hasattr(inst, "operation"):
+        return inst.operation, inst.qubits, inst.clbits
+    op = inst[0]
+    qargs = inst[1]
+    cargs = inst[2] if len(inst) > 2 else []
+    return op, qargs, cargs
+
+
+def _qasm2_dumps(circ: QuantumCircuit) -> str:
+    from qiskit.qasm2 import dumps
+    return dumps(circ)
+
+
+def sanitize_qasm_record(
+    name: str,
+    family: str,
+    num_qubits: int,
+    qasm: str,
+    canonicalize_cnot_only: bool = True,
+) -> Dict[str, Any]:
+    del num_qubits
+    circ = QuantumCircuit.from_qasm_str(str(qasm))
+    if canonicalize_cnot_only:
+        circ = canonical_cnot_circuit(circ)
+    return {"name": str(name), "family": str(family), "num_qubits": int(circ.num_qubits), "qasm": _qasm2_dumps(circ)}
 
 
 @dataclass
@@ -18,14 +50,64 @@ class CircuitSample:
     family: str
     num_qubits: int
     qasm: str
+
     _cached_circuit: QuantumCircuit | None = field(default=None, init=False, repr=False, compare=False)
+    _cached_logic_graph: LogicGraphData | None = field(default=None, init=False, repr=False, compare=False)
+    _cached_logic_graph_key: Tuple | None = field(default=None, init=False, repr=False, compare=False)
+    _cached_baseline: Tuple[Optional[float], str, Dict[str, float]] | None = field(default=None, init=False, repr=False, compare=False)
 
     def to_circuit(self) -> QuantumCircuit:
-        # Cache parsed QASM to avoid repeated reconstruction during training,
-        # validation and baseline evaluation.
         if self._cached_circuit is None:
-            self._cached_circuit = QuantumCircuit.from_qasm_str(self.qasm)
+            circ = QuantumCircuit.from_qasm_str(self.qasm)
+            if circ.num_qubits != int(self.num_qubits):
+                self.num_qubits = int(circ.num_qubits)
+            self._cached_circuit = circ
         return self._cached_circuit.copy()
+
+    def clear_cache(self) -> None:
+        self._cached_circuit = None
+        self._cached_logic_graph = None
+        self._cached_logic_graph_key = None
+        self._cached_baseline = None
+
+    def get_logic_graph(self, env_cfg: EnvConfig) -> LogicGraphData:
+        basis_key = tuple(getattr(env_cfg, "basis_gates", []) or [])
+        key = (
+            int(env_cfg.critical_window),
+            int(env_cfg.lookahead_window),
+            basis_key,
+            "cnot_only_v1",
+            getattr(env_cfg, "feature_norm_mode", "adaptive"),
+            float(getattr(env_cfg, "feature_norm_scale", 1.2)),
+        )
+        if self._cached_logic_graph is None or self._cached_logic_graph_key != key:
+            circuit = self.to_circuit()
+            try:
+                self._cached_logic_graph = build_logic_graph(
+                    circuit,
+                    critical_window=env_cfg.critical_window,
+                    lookahead_window=env_cfg.lookahead_window,
+                    basis_gates=list(basis_key) if basis_key else None,
+                    decompose=True,
+                    cnot_only=True,
+                    feature_norm_mode=getattr(env_cfg, "feature_norm_mode", "adaptive"),
+                    feature_norm_scale=float(getattr(env_cfg, "feature_norm_scale", 1.2)),
+                    feat_norm_neighbors=float(getattr(env_cfg, "feat_norm_neighbors", 15.0)),
+                    feat_norm_twoq=float(getattr(env_cfg, "feat_norm_twoq", 100.0)),
+                    feat_norm_front=float(getattr(env_cfg, "feat_norm_front", 10.0)),
+                    feat_norm_early=float(getattr(env_cfg, "feat_norm_early", 20.0)),
+                    feat_norm_weighted_degree=float(getattr(env_cfg, "feat_norm_weighted_degree", 150.0)),
+                    feat_norm_pagerank=float(getattr(env_cfg, "feat_norm_pagerank", 1.0)),
+                    feat_norm_critical=float(getattr(env_cfg, "feat_norm_critical", 30.0)),
+                )
+            except TypeError:
+                self._cached_logic_graph = build_logic_graph(
+                    circuit,
+                    critical_window=env_cfg.critical_window,
+                    lookahead_window=env_cfg.lookahead_window,
+                )
+            self._cached_logic_graph_key = key
+        return self._cached_logic_graph
 
 
 def save_jsonl(path: Path, rows: Sequence[Dict]) -> None:
@@ -54,7 +136,6 @@ def load_jsonl(path: Path) -> List[Dict]:
 def _normalize_rows(payload: Any, split: str | None = None) -> List[Dict]:
     if isinstance(payload, list):
         return payload
-
     if isinstance(payload, dict):
         if split and isinstance(payload.get(split), list):
             return payload[split]
@@ -62,14 +143,13 @@ def _normalize_rows(payload: Any, split: str | None = None) -> List[Dict]:
             value = payload.get(key)
             if isinstance(value, list):
                 return value
-
     raise ValueError(
-        "JSON manifest must be either a list of samples, "
-        "or a dict containing one of: split/train/valid/test/rows/samples/circuits/data/items."
+        "JSON manifest must be either a list of samples, or a dict containing one of: "
+        "split/train/valid/test/rows/samples/circuits/data/items."
     )
 
 
-def _validate_rows(rows: List[Dict], source: Path) -> List[Dict]:
+def _validate_rows(rows: List[Dict], source: Path, canonicalize_cnot_only: bool = True) -> List[Dict]:
     required = {"name", "family", "num_qubits", "qasm"}
     validated: List[Dict] = []
     for idx, row in enumerate(rows):
@@ -78,27 +158,34 @@ def _validate_rows(rows: List[Dict], source: Path) -> List[Dict]:
         missing = required - set(row.keys())
         if missing:
             raise KeyError(f"Invalid sample at {source}:{idx}: missing keys {sorted(missing)}")
-        validated.append(
-            {
-                "name": str(row["name"]),
-                "family": str(row["family"]),
-                "num_qubits": int(row["num_qubits"]),
-                "qasm": str(row["qasm"]),
-            }
-        )
+        try:
+            fixed = sanitize_qasm_record(
+                name=row["name"],
+                family=row["family"],
+                num_qubits=int(row["num_qubits"]),
+                qasm=str(row["qasm"]),
+                canonicalize_cnot_only=canonicalize_cnot_only,
+            )
+        except Exception as exc:
+            raise ValueError(f"Failed to parse/sanitize sample at {source}:{idx} ({row.get('name', 'unknown')}): {exc}") from exc
+        validated.append(fixed)
     return validated
 
 
-def load_records(path: Path, split: str | None = None) -> List[Dict]:
+def load_records(path: Path, split: str | None = None, canonicalize_cnot_only: bool = True, trim_idle_qubits: bool | None = None) -> List[Dict]:
+    # trim_idle_qubits is accepted for backward compatibility; canonicalize_cnot_only is the new protocol switch.
+    if trim_idle_qubits is not None:
+        canonicalize_cnot_only = bool(trim_idle_qubits)
+
     suffix = path.suffix.lower()
     if suffix in {".jsonl", ".jl"}:
         rows = load_jsonl(path)
-        return _validate_rows(rows, path)
+        return _validate_rows(rows, path, canonicalize_cnot_only=canonicalize_cnot_only)
     if suffix == ".json":
         with path.open("r", encoding="utf-8") as f:
             payload = json.load(f)
         rows = _normalize_rows(payload, split=split)
-        return _validate_rows(rows, path)
+        return _validate_rows(rows, path, canonicalize_cnot_only=canonicalize_cnot_only)
     raise ValueError(f"Unsupported manifest format: {path}")
 
 
@@ -106,21 +193,26 @@ def _default_split_path(dataset_dir: str, split: str) -> Path:
     base = Path(dataset_dir)
     if base.is_file():
         return base
-
     json_path = base / f"{split}.json"
     if json_path.exists():
         return json_path
-
     jsonl_path = base / f"{split}.jsonl"
     if jsonl_path.exists():
         return jsonl_path
-
     return json_path
 
 
-def load_split(dataset_dir: str, split: str, split_path: str | None = None) -> List[CircuitSample]:
+def load_split(
+    dataset_dir: str,
+    split: str,
+    split_path: str | None = None,
+    canonicalize_cnot_only: bool = True,
+    trim_idle_qubits: bool | None = None,
+) -> List[CircuitSample]:
+    if trim_idle_qubits is not None:
+        canonicalize_cnot_only = bool(trim_idle_qubits)
     path = Path(split_path) if split_path else _default_split_path(dataset_dir, split)
-    rows = load_records(path, split=split)
+    rows = load_records(path, split=split, canonicalize_cnot_only=canonicalize_cnot_only)
     return [CircuitSample(**row) for row in rows]
 
 
@@ -133,8 +225,7 @@ def bind_if_parameterized(circ: QuantumCircuit, seed: int) -> QuantumCircuit:
 
 
 def circuit_to_qasm2(circ: QuantumCircuit, seed: int) -> str:
-    from qiskit.qasm2 import dumps
-    return dumps(bind_if_parameterized(circ, seed))
+    return _qasm2_dumps(bind_if_parameterized(circ, seed))
 
 
 def random_qaoa(n: int, reps: int, seed: int) -> QuantumCircuit:
@@ -254,24 +345,14 @@ def generate_dataset(
         family = families[idx % len(families)]
         n = int(rng.choice(list(qubit_choices)))
         circ_seed = rng.randint(0, 10**9)
-        circ = random_circuit_family(n, family, seed=circ_seed)
-        rows.append({
-            "name": f"{family}_{n}_{idx:04d}",
-            "family": family,
-            "num_qubits": n,
-            "qasm": circuit_to_qasm2(circ, circ_seed + 1),
-        })
+        circ = canonical_cnot_circuit(random_circuit_family(n, family, seed=circ_seed))
+        rows.append({"name": f"{family}_{circ.num_qubits}_{idx:04d}", "family": family, "num_qubits": int(circ.num_qubits), "qasm": circuit_to_qasm2(circ, circ_seed + 1)})
+
     rng.shuffle(rows)
     n_total = len(rows)
     n_train = int(n_total * split_ratio[0])
     n_valid = int(n_total * split_ratio[1])
     base = Path(dataset_dir)
-    train_rows = rows[:n_train]
-    valid_rows = rows[n_train:n_train + n_valid]
-    test_rows = rows[n_train + n_valid:]
-
-    # Keep a single authoritative manifest format to avoid redundant files and
-    # accidental split mismatch between json/jsonl copies.
-    save_json(base / "train.json", train_rows)
-    save_json(base / "valid.json", valid_rows)
-    save_json(base / "test.json", test_rows)
+    save_json(base / "train.json", rows[:n_train])
+    save_json(base / "valid.json", rows[n_train:n_train + n_valid])
+    save_json(base / "test.json", rows[n_train + n_valid:])

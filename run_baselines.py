@@ -64,7 +64,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rl_beam_logic_branch", type=int, default=2)
     p.add_argument("--rl_beam_physical_branch", type=int, default=4)
     p.add_argument("--rl_beam_reward_weight", type=float, default=0.20)
-    p.add_argument("--rl_keep_eval_candidate_ranking", action="store_true")
     p.add_argument("--rl_tabu_iters", type=int, default=12)
     p.add_argument("--rl_tabu_candidate_qubits", type=int, default=6)
     p.add_argument("--rl_tabu_relocate_candidates", type=int, default=3)
@@ -150,7 +149,6 @@ def evaluate_rl_on_sample(args, rl_pack, sample):
             logic_branch=args.rl_beam_logic_branch,
             physical_branch=args.rl_beam_physical_branch,
             beam_reward_weight=args.rl_beam_reward_weight,
-            disable_candidate_ranking_eval=not args.rl_keep_eval_candidate_ranking,
         )
         mode = f"beam{args.rl_beam_width}"
     else:

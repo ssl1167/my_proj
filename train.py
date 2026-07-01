@@ -21,27 +21,51 @@ from garl_sabre.topology import build_hardware_topology
 from garl_sabre.utils import obs_to_torch, save_json, set_seed
 
 METRIC_FIELDS = [
-    "swap_count",
-    "routing_time_sec",
     "routing_score",
     "terminal_objective",
+    "additional_cnot_count",
+    "paper_additional_cnot_count",
+    "physical_cnot_count",
+    "logical_cnot_count",
+    "active_logical_qubits",
+    "inserted_swap_count",
+    "inserted_bridge_count",
+    "swap_count",
+    "additional_swap_count",
+    "routing_time_sec",
+    "runtime",
+
+    "input_num_qubits",
+    "input_gate_count_all",
+    "input_1q_count_all",
+    "input_2q_count_all",
+    "input_cnot_count_all",
+    "input_swap_raw_count",
+    "input_depth",
+
+    "original_num_qubits",
     "original_gate_count_all",
     "original_1q_count_all",
     "original_2q_count_all",
     "original_cnot_count_all",
+    "original_swap_raw_count",
+    "original_cnot_equiv_count",
     "original_depth",
+
     "routed_gate_count_all",
     "routed_1q_count_all",
     "routed_2q_count_all",
     "routed_cnot_raw_count",
+    "routed_swap_raw_count",
     "routed_cnot_equiv_count",
-    "routed_swap_count",
     "routed_depth",
+
     "additional_gates_total",
     "additional_1q_total",
     "additional_2q_total",
-    "additional_swap_count",
-    "additional_cnot_equiv_from_swap",
+    "additional_cx_total",
+    "additional_cx_total_nonnegative",
+    "cnot_equiv_overhead",
     "depth_overhead",
 ]
 
@@ -73,8 +97,6 @@ def make_env(args: argparse.Namespace) -> InitialLayoutEnv:
     env_cfg = EnvConfig(
         critical_window=args.critical_window,
         lookahead_window=args.lookahead_window,
-        candidate_topk=args.candidate_topk,
-        use_candidate_ranking=not args.disable_candidate_ranking,
         use_physical_prior=True,
         sabre_seed=args.seed,
         optimization_level=args.optimization_level,
@@ -83,20 +105,27 @@ def make_env(args: argparse.Namespace) -> InitialLayoutEnv:
         action_mode=args.action_mode,
         logic_order_mode=args.logic_order_mode,
         baseline_mode=args.baseline_mode,
-        evaluation_mode="legacy",
-        router_backend="qiskit",
+        evaluation_mode="paper_additional_cnot",
+        metric_mode="additional_cnot_count",
+        benchmark_preprocess="cnot_active_cnot_only",
+        router_backend=args.router_backend,
     )
     reward_cfg = RewardConfig(terminal_scale=args.terminal_scale)
     return InitialLayoutEnv(hardware, env_cfg, reward_cfg)
 
 
-def build_model_from_env(env: InitialLayoutEnv, sample_circuit, hidden_dim: int, graph_layers: int, dropout: float,
+def build_model_from_env(env: InitialLayoutEnv, sample, hidden_dim: int, graph_layers: int, dropout: float,
                          physical_prior_scale: float, physical_prior_clip: float, device: torch.device):
-    obs = env.reset(sample_circuit)
+# 注入并同步基线缓存
+    if sample._cached_baseline is None:
+        obs = env.reset(sample.to_circuit(), logic_graph=sample.get_logic_graph(env.env_cfg))
+        sample._cached_baseline = (env.baseline_score, env.baseline_name, env.baseline_metrics)
+    else:
+        obs = env.reset(sample.to_circuit(), logic_graph=sample.get_logic_graph(env.env_cfg), baseline_info=sample._cached_baseline)
+
     logic_feat_dim = int(obs["logic_node_features"].shape[-1])
     phys_feat_dim = int(obs["physical_node_features"].shape[-1])
-    candidate_feat_dim = int(obs["candidate_features_bank"].shape[-1])
-    logical_candidate_feat_dim = int(obs["logical_candidate_features"].shape[-1])
+    edge_feat_dim = 5  # edge_freq, edge_first_layer, edge_front, edge_early, edge_log_f
     cfg = ModelConfig(
         hidden_dim=hidden_dim,
         graph_layers=graph_layers,
@@ -108,15 +137,19 @@ def build_model_from_env(env: InitialLayoutEnv, sample_circuit, hidden_dim: int,
         cfg,
         logic_feat_dim=logic_feat_dim,
         phys_feat_dim=phys_feat_dim,
-        candidate_feat_dim=candidate_feat_dim,
-        logical_candidate_feat_dim=logical_candidate_feat_dim,
+        edge_feat_dim=edge_feat_dim,
     ).to(device)
     return model, cfg
 
 
 @torch.no_grad()
-def run_eval_episode(model: GraphAwarePolicy, env: InitialLayoutEnv, circuit, device: torch.device):
-    obs = env.reset(circuit)
+def run_eval_episode(model: GraphAwarePolicy, env: InitialLayoutEnv, sample, device: torch.device):
+    # 确保基线已计算，并传入
+    if sample._cached_baseline is None:
+        obs = env.reset(sample.to_circuit(), is_training=False, logic_graph=sample.get_logic_graph(env.env_cfg))
+        sample._cached_baseline = (env.baseline_score, env.baseline_name, env.baseline_metrics)
+    else:
+        obs = env.reset(sample.to_circuit(), is_training=False, logic_graph=sample.get_logic_graph(env.env_cfg), baseline_info=sample._cached_baseline)
     done = False
     total_reward = 0.0
     info: Dict = {}
@@ -158,7 +191,8 @@ def choose_eval_subset(samples: Sequence, eval_episodes: int, rng: np.random.Gen
 @torch.no_grad()
 def evaluate_policy(model: GraphAwarePolicy, env: InitialLayoutEnv, samples: Sequence, device: torch.device) -> Dict[str, Optional[float]]:
     model.eval()
-    rows = [run_eval_episode(model, env, sample.to_circuit(), device) for sample in samples]
+    # 原代码是 sample.to_circuit()，现改为直接传 sample
+    rows = [run_eval_episode(model, env, sample, device) for sample in samples]
     model.train()
     return aggregate_eval_rows(rows)
 
@@ -228,16 +262,10 @@ def maybe_apply_stage_overrides(args: argparse.Namespace, env: InitialLayoutEnv,
                                 stage_qubits: int, is_last_stage: bool) -> Dict[str, float | int | bool]:
     if stage_qubits < args.late_stage_start_qubits:
         return {
-            "stage_candidate_topk": int(env.env_cfg.candidate_topk),
-            "stage_use_candidate_ranking": bool(env.env_cfg.use_candidate_ranking),
             "stage_physical_prior_scale": float(model.cfg.physical_prior_scale),
             "stage_entropy_coef": float(ppo_cfg.entropy_coef),
             "stage_lr": float(optimizer.param_groups[0]["lr"]),
         }
-    if args.late_stage_candidate_topk > 0:
-        env.env_cfg.candidate_topk = int(args.late_stage_candidate_topk)
-    if args.late_stage_disable_candidate_ranking:
-        env.env_cfg.use_candidate_ranking = False
     if args.late_stage_physical_prior_scale is not None:
         model.cfg.physical_prior_scale = float(args.late_stage_physical_prior_scale)
     if args.late_stage_entropy_coef is not None:
@@ -248,8 +276,6 @@ def maybe_apply_stage_overrides(args: argparse.Namespace, env: InitialLayoutEnv,
         set_optimizer_lr(optimizer, args.lr * args.final_stage_lr_decay)
 
     return {
-        "stage_candidate_topk": int(env.env_cfg.candidate_topk),
-        "stage_use_candidate_ranking": bool(env.env_cfg.use_candidate_ranking),
         "stage_physical_prior_scale": float(model.cfg.physical_prior_scale),
         "stage_entropy_coef": float(ppo_cfg.entropy_coef),
         "stage_lr": float(optimizer.param_groups[0]["lr"]),
@@ -274,7 +300,7 @@ def run_training(args: argparse.Namespace) -> None:
     env = make_env(args)
     model, model_cfg = build_model_from_env(
         env,
-        train_samples[0].to_circuit(),
+        train_samples[0],  # 传 sample 对象过去，而不是单纯传 circuit
         args.hidden_dim,
         args.graph_layers,
         args.dropout,
@@ -311,21 +337,23 @@ def run_training(args: argparse.Namespace) -> None:
             "model_cfg": asdict(model_cfg),
             "ppo_cfg": asdict(ppo_cfg),
             "metrics": METRIC_FIELDS,
-            "mode": "clean_swap_only_initial_mapping",
+            "mode": "paper_cnot_active_additional_cnot_initial_mapping",
         },
     )
 
-    best_valid_swap: Optional[float] = None
+    best_valid_additional_cnot: Optional[float] = None
     best_valid_by_stage: Dict[int, float] = {}
     curriculum = sorted(args.curriculum)
 
+    max_hardware_qubits = int(env.hardware.num_qubits)
     for stage_idx, stage_qubits in enumerate(curriculum):
-        stage_train = [s for s in train_samples if s.num_qubits <= stage_qubits]
-        stage_valid = [s for s in valid_samples if s.num_qubits <= stage_qubits]
+        stage_limit = min(int(stage_qubits), max_hardware_qubits)
+        stage_train = [s for s in train_samples if s.num_qubits <= stage_limit]
+        stage_valid = [s for s in valid_samples if s.num_qubits <= stage_limit]
         if not stage_train:
             continue
         if not stage_valid:
-            raise RuntimeError(f"Validation subset is empty for stage <= {stage_qubits} qubits.")
+            raise RuntimeError(f"Validation subset is empty for stage <= {stage_limit} active logical qubits.")
 
         is_second_last = stage_idx == len(curriculum) - 2
         is_last = stage_idx == len(curriculum) - 1
@@ -341,12 +369,10 @@ def run_training(args: argparse.Namespace) -> None:
             effective_epochs = args.late_stage_epochs_per_stage
 
         print(
-            f"\n[Stage <= {stage_qubits} qubits] "
+            f"\n[Stage <= {stage_limit} active logical qubits] "
             f"train={len(stage_train)} valid={len(stage_valid)} "
             f"epochs={effective_epochs} episodes={args.episodes_per_epoch} "
             f"lr={optimizer.param_groups[0]['lr']:.6g} "
-            f"cand_topk={env.env_cfg.candidate_topk} "
-            f"cand_rank={env.env_cfg.use_candidate_ranking} "
             f"prior={model.cfg.physical_prior_scale:.4f} "
             f"entropy={ppo_cfg.entropy_coef:.5f}"
         )
@@ -355,12 +381,17 @@ def run_training(args: argparse.Namespace) -> None:
         for epoch in range(effective_epochs):
             buffer_rows = []
             episode_returns: List[float] = []
-            episode_swaps: List[Optional[float]] = []
+            episode_additional_cnot: List[Optional[float]] = []
 
             iterator = stage_episode_iterator(stage_train, args.episodes_per_epoch, args.family_balance_mode, stage_rng)
             pbar = tqdm(iterator, total=args.episodes_per_epoch, desc=f"stage={stage_qubits} epoch={epoch}")
             for sample in pbar:
-                obs = env.reset(sample.to_circuit())
+                # --- 核心修改 4：在最核心、调用频次最高的循环里，挂载 O(1) 复杂度的缓存图 ---
+                if sample._cached_baseline is None:
+                    obs = env.reset(sample.to_circuit(), is_training=True, logic_graph=sample.get_logic_graph(env.env_cfg))
+                    sample._cached_baseline = (env.baseline_score, env.baseline_name, env.baseline_metrics)
+                else:
+                    obs = env.reset(sample.to_circuit(), is_training=True, logic_graph=sample.get_logic_graph(env.env_cfg), baseline_info=sample._cached_baseline)
                 done = False
                 traj = TrajectoryBuffer()
                 total_reward = 0.0
@@ -387,10 +418,10 @@ def run_training(args: argparse.Namespace) -> None:
 
                 buffer_rows.extend(traj.compute_returns_advantages(ppo_cfg))
                 episode_returns.append(total_reward)
-                episode_swaps.append(info.get("swap_count", None))
+                episode_additional_cnot.append(info.get("additional_cnot_count", info.get("routing_score", None)))
                 pbar.set_postfix({
                     "reward": fmt_metric(safe_mean(episode_returns), precision=3),
-                    "swap": fmt_metric(safe_mean(episode_swaps), precision=2),
+                    "add_cnot": fmt_metric(safe_mean(episode_additional_cnot), precision=2),
                 })
 
             train_metrics = ppo_update(model, optimizer, buffer_rows, ppo_cfg, device)
@@ -399,14 +430,14 @@ def run_training(args: argparse.Namespace) -> None:
             valid_metrics = evaluate_policy(model, env, eval_subset, device)
 
             summary = {
-                "stage_qubits": int(stage_qubits),
+                "stage_qubits": int(stage_limit),
                 "epoch": int(epoch),
                 "num_eval_samples": int(len(eval_subset)),
                 "train_reward": safe_mean(episode_returns),
-                "train_swap": safe_mean(episode_swaps),
+                "train_additional_cnot": safe_mean(episode_additional_cnot),
                 "valid_reward": valid_metrics["reward"],
-                "valid_swap": valid_metrics["swap_count"],
-                **{f"valid_{field}": valid_metrics[field] for field in METRIC_FIELDS if field != "swap_count"},
+                "valid_additional_cnot": valid_metrics.get("additional_cnot_count", valid_metrics.get("routing_score")),
+                **{f"valid_{field}": valid_metrics[field] for field in METRIC_FIELDS if field != "additional_cnot_count"},
                 **stage_override_info,
                 **train_metrics,
             }
@@ -417,21 +448,21 @@ def run_training(args: argparse.Namespace) -> None:
             payload = checkpoint_payload(model, optimizer, model_cfg, env, summary, args, stage_idx, stage_qubits, epoch)
             torch.save(payload, out_dir / "last_model.pt")
 
-            stage_swap = summary["valid_swap"]
-            if stage_swap is not None:
-                stage_swap_val = float(stage_swap)
+            stage_additional_cnot = summary["valid_additional_cnot"]
+            if stage_additional_cnot is not None:
+                stage_additional_cnot_val = float(stage_additional_cnot)
                 prev_stage_best = best_valid_by_stage.get(stage_qubits)
-                if prev_stage_best is None or stage_swap_val < prev_stage_best:
-                    best_valid_by_stage[stage_qubits] = stage_swap_val
+                if prev_stage_best is None or stage_additional_cnot_val < prev_stage_best:
+                    best_valid_by_stage[stage_qubits] = stage_additional_cnot_val
                     torch.save(payload, out_dir / f"best_model_stage_{stage_qubits}.pt")
-                if best_valid_swap is None or stage_swap_val < best_valid_swap:
-                    best_valid_swap = stage_swap_val
+                if best_valid_additional_cnot is None or stage_additional_cnot_val < best_valid_additional_cnot:
+                    best_valid_additional_cnot = stage_additional_cnot_val
                     torch.save(payload, out_dir / "best_model.pt")
 
     save_json(
         str(out_dir / "final_summary.json"),
         {
-            "best_valid_swap": best_valid_swap,
+            "best_valid_additional_cnot": best_valid_additional_cnot,
             "best_valid_by_stage": best_valid_by_stage,
             "history_path": str(history_jsonl),
         },
@@ -439,21 +470,21 @@ def run_training(args: argparse.Namespace) -> None:
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Clean swap-only trainer with unified gate accounting.")
+    p = argparse.ArgumentParser(description="Paper-protocol trainer using CNOT-active circuits and additional CNOT accounting.")
     p.add_argument("--dataset_dir", type=str, default="data/demo")
     p.add_argument("--train_manifest", type=str, default="")
     p.add_argument("--valid_manifest", type=str, default="")
-    p.add_argument("--save_dir", type=str, default="outputs/ppo_clean_run")
+    p.add_argument("--save_dir", type=str, default="outputs/0607")
     p.add_argument("--generate_dataset", action="store_true")
     p.add_argument("--num_circuits", type=int, default=120)
     p.add_argument("--families", nargs="+", default=["qaoa", "hea", "qft", "grover", "adder", "random", "routing_stress"])
 
     p.add_argument("--phys_rows", type=int, default=0)
     p.add_argument("--phys_cols", type=int, default=0)
-    p.add_argument("--topology_mode", type=str, default="heavy_hex", choices=["grid", "bottleneck_grid", "ibm_q20", "heavy_hex"])
+    p.add_argument("--topology_mode", type=str, default="ibm_q20", choices=["ibm_q20","heavy_hex"])
     p.add_argument("--topology_distance", type=int, default=5)
 
-    p.add_argument("--curriculum", type=int, nargs="+", default=[12, 16, 20, 24, 28, 32, 36])
+    p.add_argument("--curriculum", type=int, nargs="+", default=[10, 14, 16, 20])
     p.add_argument("--epochs_per_stage", type=int, default=5)
     p.add_argument("--late_stage_epochs_per_stage", type=int, default=0)
     p.add_argument("--episodes_per_epoch", type=int, default=40)
@@ -462,28 +493,25 @@ def build_argparser() -> argparse.ArgumentParser:
 
     p.add_argument("--critical_window", type=int, default=8)
     p.add_argument("--lookahead_window", type=int, default=16)
-    p.add_argument("--candidate_topk", type=int, default=16)
-    p.add_argument("--disable_candidate_ranking", action="store_true")
     p.add_argument("--optimization_level", type=int, default=0)
-    p.add_argument("--action_mode", type=str, default="hierarchical", choices=["hierarchical", "fixed_order_physical"])
-    p.add_argument("--logic_order_mode", type=str, default="priority_fixed", choices=["priority_fixed", "front_first", "index"])
-    p.add_argument("--baseline_mode", type=str, default="dense", choices=["none", "trivial", "dense", "hybrid"])
-    p.add_argument("--terminal_scale", type=float, default=1.0)
+    p.add_argument("--action_mode", type=str, default="fixed_order_physical", choices=["hierarchical", "fixed_order_physical"])
+    
+    p.add_argument("--terminal_scale", type=float, default=20.0)
 
     p.add_argument("--hidden_dim", type=int, default=128)
     p.add_argument("--graph_layers", type=int, default=3)
     p.add_argument("--dropout", type=float, default=0.1)
-    p.add_argument("--physical_prior_scale", type=float, default=0.15)
+    p.add_argument("--physical_prior_scale", type=float, default=0.35)
     p.add_argument("--physical_prior_clip", type=float, default=3.5)
 
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--train_iters", type=int, default=4)
-    p.add_argument("--minibatch_size", type=int, default=16)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--train_iters", type=int, default=10)
+    p.add_argument("--minibatch_size", type=int, default=64)
     p.add_argument("--target_kl", type=float, default=0.03)
-    p.add_argument("--clip_ratio", type=float, default=0.10)
+    p.add_argument("--clip_ratio", type=float, default=0.20)
     p.add_argument("--entropy_coef", type=float, default=0.02)
     p.add_argument("--value_coef", type=float, default=0.5)
-    p.add_argument("--max_grad_norm", type=float, default=0.5)
+    p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--value_clip", type=float, default=0.2)
 
     p.add_argument("--stage_lr_decay", type=float, default=0.5)
@@ -491,12 +519,15 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--late_stage_start_qubits", type=int, default=32)
     p.add_argument("--late_stage_lr", type=float, default=None)
     p.add_argument("--late_stage_entropy_coef", type=float, default=None)
-    p.add_argument("--late_stage_candidate_topk", type=int, default=-1)
-    p.add_argument("--late_stage_disable_candidate_ranking", action="store_true")
     p.add_argument("--late_stage_physical_prior_scale", type=float, default=None)
 
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--cpu", action="store_true")
+
+    p.add_argument("--logic_order_mode", type=str, default="priority_fixed", choices=["priority_fixed", "front_first", "index"])
+    # 增加 sabre 到 choices
+    p.add_argument("--baseline_mode", type=str, default="dense", choices=["none", "trivial", "dense", "sabre"])
+    p.add_argument("--router_backend", type=str, default="qiskit", choices=["qiskit", "tket"])
     return p
 
 

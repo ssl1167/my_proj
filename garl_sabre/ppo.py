@@ -167,7 +167,7 @@ def ppo_update(model, optimizer, rows: List[Dict[str, torch.Tensor]], cfg: PPOCo
 
     adv_tensor = torch.stack([x["advantage"] for x in rows])
     adv_mean = adv_tensor.mean()
-    adv_std = adv_tensor.std() + 1e-8
+    adv_std = adv_tensor.std(unbiased=False) + 1e-8
 
     normalized_rows: List[Dict[str, torch.Tensor]] = []
     for r in rows:
@@ -185,6 +185,7 @@ def ppo_update(model, optimizer, rows: List[Dict[str, torch.Tensor]], cfg: PPOCo
 
     metrics = {"loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "approx_kl": 0.0}
     steps = 0
+    total_kl = 0.0
 
     model.train()
     target_kl = getattr(cfg, "target_kl", 0.08)
@@ -194,6 +195,10 @@ def ppo_update(model, optimizer, rows: List[Dict[str, torch.Tensor]], cfg: PPOCo
     for _ in range(cfg.train_iters):
         if early_stop:
             break
+        
+        epoch_kl = 0.0
+        epoch_steps = 0
+        
         for batch in loader:
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             eval_out = model.evaluate_actions(batch, batch["action_logical"], batch["action_physical"])
@@ -222,17 +227,24 @@ def ppo_update(model, optimizer, rows: List[Dict[str, torch.Tensor]], cfg: PPOCo
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
             optimizer.step()
 
-            approx_kl = (old_logprob - new_logprob).mean().abs().item()
+            logratio = new_logprob - old_logprob
+            approx_kl = ((torch.exp(logratio) - 1.0) - logratio).mean().item()
+            epoch_kl += approx_kl
+            epoch_steps += 1
+            
             metrics["loss"] += float(loss.item())
             metrics["policy_loss"] += float(policy_loss.item())
             metrics["value_loss"] += float(value_loss.item())
             metrics["entropy"] += float(entropy.item())
-            metrics["approx_kl"] += float(approx_kl)
+            metrics["approx_kl"] += approx_kl
             steps += 1
-
-            if approx_kl > target_kl:
-                early_stop = True
-                break
+        
+        # 在完整迭代后检查 KL，而非每个 minibatch
+        avg_epoch_kl = epoch_kl / epoch_steps if epoch_steps > 0 else 0.0
+        total_kl += avg_epoch_kl
+        if avg_epoch_kl > target_kl:
+            early_stop = True
+            break
 
     if steps > 0:
         for k in metrics:
