@@ -115,24 +115,28 @@ def count_two_qubit_gates(circuit: QuantumCircuit) -> int:
     return total
 
 
-def circuit_gate_profile(circuit: QuantumCircuit) -> Dict[str, float]:
+def circuit_gate_profile(circuit: QuantumCircuit, active_qubits_only: bool = False) -> Dict[str, float]:
     ignored_ops = {"barrier", "measure", "delay", "reset"}
     physical_ops = []
+    active_qubits: set[int] = set()
     for item in circuit.data:
-        op, _, _ = _instruction_parts(item)
+        op, qargs, _ = _instruction_parts(item)
         if getattr(op, "name", "") not in ignored_ops:
             physical_ops.append(item)
+            for q in qargs:
+                active_qubits.add(int(circuit.find_bit(q).index))
 
     twoq_gates = float(count_two_qubit_gates(circuit))
     swap_count = float(count_swaps(circuit))
     cx_count = float(count_named_gate(circuit, "cx"))
+    num_qubits = len(active_qubits) if active_qubits_only and active_qubits else circuit.num_qubits
     try:
         depth = float(circuit.depth())
     except Exception:
         depth = float("nan")
 
     return {
-        "num_qubits": float(circuit.num_qubits),
+        "num_qubits": float(num_qubits),
         "gate_count_all": float(len(physical_ops)),
         "oneq_count_all": float(max(0.0, float(len(physical_ops)) - twoq_gates)),
         "twoq_count_all": float(twoq_gates),
@@ -154,10 +158,11 @@ def _additional_cnot_from_profiles(original_profile: Dict[str, float], routed_pr
 
 
 def _build_metrics(raw_circuit: QuantumCircuit, prepared: QuantumCircuit, routed: QuantumCircuit, elapsed: float, evaluating_router: str) -> Dict[str, float | str]:
-    original_profile = circuit_gate_profile(prepared)
+    source_profile = circuit_gate_profile(raw_circuit, active_qubits_only=True)
+    original_profile = circuit_gate_profile(prepared, active_qubits_only=True)
     routed_profile = circuit_gate_profile(routed)
 
-    logical_cnot_count = float(original_profile["cx_count_all"])
+    logical_cnot_count = float(source_profile["cx_count_all"])
     active_logical_qubits = float(original_profile["num_qubits"])
 
     inserted_swap_count, additional_cx_total_nonnegative, additional_cnot_count = _additional_cnot_from_profiles(original_profile, routed_profile)
@@ -203,22 +208,25 @@ def _build_metrics(raw_circuit: QuantumCircuit, prepared: QuantumCircuit, routed
         "runtime": float(elapsed),
         "evaluating_router": evaluating_router,
 
-        "input_num_qubits": float(original_profile["num_qubits"]),
-        "input_gate_count_all": float(original_profile["gate_count_all"]),
-        "input_1q_count_all": float(original_profile["oneq_count_all"]),
-        "input_2q_count_all": float(original_profile["twoq_count_all"]),
-        "input_cnot_count_all": float(original_profile["cx_count_all"]),
-        "input_swap_raw_count": float(original_profile["swap_count"]),
-        "input_depth": float(original_profile["depth"]),
+        "input_num_qubits": float(source_profile["num_qubits"]),
+        "input_gate_count_all": float(source_profile["gate_count_all"]),
+        "input_1q_count_all": float(source_profile["oneq_count_all"]),
+        "input_2q_count_all": float(source_profile["twoq_count_all"]),
+        "input_cnot_count_all": float(source_profile["cx_count_all"]),
+        "input_swap_raw_count": float(source_profile["swap_count"]),
+        "input_depth": float(source_profile["depth"]),
 
-        "original_num_qubits": float(original_profile["num_qubits"]),
-        "original_gate_count_all": float(original_profile["gate_count_all"]),
-        "original_1q_count_all": float(original_profile["oneq_count_all"]),
-        "original_2q_count_all": original_2q,
-        "original_cnot_count_all": float(original_profile["cx_count_all"]),
-        "original_swap_raw_count": original_swap_raw,
-        "original_cnot_equiv_count": original_cnot_equiv_count,
-        "original_depth": float(original_profile["depth"]),
+        "original_num_qubits": float(source_profile["num_qubits"]),
+        "original_gate_count_all": float(source_profile["gate_count_all"]),
+        "original_1q_count_all": float(source_profile["oneq_count_all"]),
+        "original_2q_count_all": float(source_profile["twoq_count_all"]),
+        "original_cnot_count_all": float(source_profile["cx_count_all"]),
+        "original_swap_raw_count": float(source_profile["swap_count"]),
+        "original_cnot_equiv_count": float(source_profile["twoq_count_all"] + 2.0 * source_profile["swap_count"]),
+        "original_depth": float(source_profile["depth"]),
+        "routing_input_num_qubits": float(original_profile["num_qubits"]),
+        "routing_input_gate_count_all": float(original_profile["gate_count_all"]),
+        "routing_input_cnot_count_all": float(original_profile["cx_count_all"]),
 
         "routed_gate_count_all": float(routed_profile["gate_count_all"]),
         "routed_1q_count_all": float(routed_profile["oneq_count_all"]),

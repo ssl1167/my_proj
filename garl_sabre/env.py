@@ -31,6 +31,7 @@ class InitialLayoutEnv:
         self.reward_cfg = reward_cfg or RewardConfig()
 
         self.circuit: Optional[QuantumCircuit] = None
+        self.raw_circuit: Optional[QuantumCircuit] = None
         self.logic: Optional[LogicGraphData] = None
         self.mapping_log_to_phys: Optional[np.ndarray] = None
         self.used_phys: Optional[np.ndarray] = None
@@ -114,6 +115,7 @@ class InitialLayoutEnv:
                 f"but hardware only has {self.hardware.num_qubits}."
             )
 
+        self.raw_circuit = circuit.copy()
         self.circuit = prepared_circuit.copy()
         
         # --- 核心修改 3：依赖注入优先。如有缓存图则极速挂载，否则执行回退计算 ---
@@ -427,7 +429,7 @@ class InitialLayoutEnv:
     def _execute_dual_backend_routing(self, layout: list[int]) -> Dict[str, float]:
         """Run the configured router backend and return routing metrics."""
         # 直接调用底层的 evaluate_layout_metrics，那里已经统一拦截并处理了 qiskit 和 tket
-        return evaluate_layout_metrics(self.circuit, layout, self.hardware, self.env_cfg)
+        return evaluate_layout_metrics(self.raw_circuit or self.circuit, layout, self.hardware, self.env_cfg)
 
     def step(self, action: int | Sequence[int] | np.ndarray) -> StepOutput:
         assert self.logic is not None and self.mapping_log_to_phys is not None and self.used_phys is not None and self.circuit is not None

@@ -147,7 +147,7 @@ def convert_paper19_to_json(paper19_dir: Path, output_dir: Path, strict_sanity: 
             "name": stem,
             "family": family,
             "num_qubits": int(qc.num_qubits),
-            "qasm": dumps(qc),
+            "qasm": dumps(raw_qc),
         })
 
     if not rows:

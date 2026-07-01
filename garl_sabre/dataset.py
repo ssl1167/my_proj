@@ -59,8 +59,6 @@ class CircuitSample:
     def to_circuit(self) -> QuantumCircuit:
         if self._cached_circuit is None:
             circ = QuantumCircuit.from_qasm_str(self.qasm)
-            if circ.num_qubits != int(self.num_qubits):
-                self.num_qubits = int(circ.num_qubits)
             self._cached_circuit = circ
         return self._cached_circuit.copy()
 
