@@ -15,7 +15,7 @@ from garl_sabre.dataset import CircuitSample, save_json
 from garl_sabre.env import InitialLayoutEnv
 from garl_sabre.heuristics import best_of_random, dense_layout, sabre_layout, trivial_layout
 from garl_sabre.model import GraphAwarePolicy
-from garl_sabre.qiskit_runner import canonical_cnot_circuit, evaluate_layout_metrics, objective_from_metrics
+from garl_sabre.qiskit_runner import canonical_cnot_circuit, evaluate_full_sabre_metrics, evaluate_layout_metrics, objective_from_metrics
 from garl_sabre.topology import build_hardware_topology
 from garl_sabre.circuit_features import build_logic_graph
 
@@ -236,8 +236,16 @@ def evaluate_baselines(samples: List[CircuitSample], hardware, args) -> List[Dic
         candidates = {
             "trivial": trivial_layout(logic.num_qubits),
             "dense": dense_layout(logic, hardware),
-            "random_best": best_of_random(circuit, hardware, env_cfg, reward_cfg=reward_cfg, trials=args.random_trials, seed=args.seed),
         }
+        if args.random_trials > 0:
+            candidates["random_best"] = best_of_random(
+                circuit,
+                hardware,
+                env_cfg,
+                reward_cfg=reward_cfg,
+                trials=args.random_trials,
+                seed=args.seed,
+            )
         try:
             candidates["sabre_layout"] = sabre_layout(circuit, hardware, seed=args.seed)
         except Exception as exc:
@@ -250,6 +258,22 @@ def evaluate_baselines(samples: List[CircuitSample], hardware, args) -> List[Dic
             metrics["routing_score"] = score
             metrics["terminal_objective"] = score
             row = _row_from_info(sample, method_name, metrics)
+            _check_metric_consistency(row)
+            rows.append(row)
+        if args.full_sabre_seeds > 0:
+            seeds = list(range(int(args.seed), int(args.seed) + int(args.full_sabre_seeds)))
+            metrics = evaluate_full_sabre_metrics(
+                circuit,
+                hardware,
+                env_cfg,
+                seeds=seeds,
+                optimization_level=args.full_sabre_optimization_level,
+            )
+            score = float(objective_from_metrics(metrics, reward_cfg, env_cfg))
+            metrics = dict(metrics)
+            metrics["routing_score"] = score
+            metrics["terminal_objective"] = score
+            row = _row_from_info(sample, "qiskit_full_sabre", metrics)
             _check_metric_consistency(row)
             rows.append(row)
     return rows
@@ -306,6 +330,9 @@ def main():
     parser.add_argument("--tabu_tenure", type=int, default=5)
     parser.add_argument("--tabu_exact_every", type=int, default=0)
     parser.add_argument("--random_trials", type=int, default=64)
+    parser.add_argument("--full_sabre_seeds", type=int, default=64)
+    parser.add_argument("--full_sabre_optimization_level", type=int, default=0)
+    parser.add_argument("--skip_rl", action="store_true")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--no_sanity_check", action="store_true")
@@ -322,7 +349,11 @@ def main():
     print(f"Hardware: {hardware.num_qubits} qubits, topology={hardware.topology_name}")
 
     print("\n=== Step 3: RL model evaluation ===")
-    rl_results = evaluate_rl_model(samples, args.checkpoint, hardware, args)
+    if args.skip_rl:
+        print("Skipping RL checkpoint evaluation (--skip_rl).")
+        rl_results = []
+    else:
+        rl_results = evaluate_rl_model(samples, args.checkpoint, hardware, args)
 
     print("\n=== Step 4: baseline evaluation ===")
     baseline_results = evaluate_baselines(samples, hardware, args)

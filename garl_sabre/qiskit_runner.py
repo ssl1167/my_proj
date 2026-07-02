@@ -274,6 +274,61 @@ def evaluate_initial_mapping_with_router(circuit: QuantumCircuit, layout: Sequen
     return evaluate_layout_metrics(circuit, layout, hardware, env_cfg or EnvConfig())
 
 
+def evaluate_full_sabre_metrics(
+    circuit: QuantumCircuit,
+    hardware: HardwareTopology,
+    env_cfg: EnvConfig | None = None,
+    seeds: Sequence[int] | None = None,
+    optimization_level: int = 0,
+) -> Dict[str, float | str]:
+    """Evaluate Qiskit SABRE when layout and routing are optimized together.
+
+    This is a routing baseline rather than an initial-layout-only score.  It is
+    useful for paper-table comparisons because it keeps the original CNOT-only
+    gate sequence intact at optimization_level=0 while allowing SABRE to choose
+    a layout and route in one pass.
+    """
+    env_cfg = env_cfg or EnvConfig()
+    prepared = prepare_basis_circuit(circuit, env_cfg)
+    seed_list = list(seeds) if seeds is not None else [int(getattr(env_cfg, "sabre_seed", 7))]
+    if not seed_list:
+        seed_list = [int(getattr(env_cfg, "sabre_seed", 7))]
+
+    best_metrics: Dict[str, float | str] | None = None
+    best_score: float | None = None
+    total_elapsed = 0.0
+    best_seed = seed_list[0]
+
+    for seed in seed_list:
+        start = time.perf_counter()
+        routed = transpile(
+            prepared,
+            coupling_map=hardware.coupling_map,
+            basis_gates=_basis_with_swap(env_cfg),
+            layout_method="sabre",
+            routing_method="sabre",
+            optimization_level=int(optimization_level),
+            seed_transpiler=int(seed),
+        )
+        elapsed = time.perf_counter() - start
+        total_elapsed += elapsed
+        metrics = _build_metrics(circuit, prepared, routed, elapsed, evaluating_router="qiskit_full_sabre")
+        score = float(objective_from_metrics(metrics, RewardConfig(), env_cfg))
+        if best_score is None or score < best_score:
+            best_score = score
+            best_metrics = dict(metrics)
+            best_seed = int(seed)
+
+    assert best_metrics is not None
+    best_metrics["routing_time_sec"] = float(total_elapsed)
+    best_metrics["runtime"] = float(total_elapsed)
+    best_metrics["evaluating_router"] = "qiskit_full_sabre_seed_sweep"
+    best_metrics["sabre_best_seed"] = float(best_seed)
+    best_metrics["sabre_num_seeds"] = float(len(seed_list))
+    best_metrics["sabre_optimization_level"] = float(optimization_level)
+    return best_metrics
+
+
 def evaluate_layout_metrics(circuit: QuantumCircuit, layout: Sequence[int], hardware: HardwareTopology, env_cfg: EnvConfig | None = None) -> Dict[str, float | str]:
     env_cfg = env_cfg or EnvConfig()
     if getattr(env_cfg, "router_backend", "qiskit") == "tket":

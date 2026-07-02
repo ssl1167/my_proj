@@ -9,7 +9,7 @@ from qiskit.compiler import transpile
 
 from .circuit_features import LogicGraphData, build_logic_graph
 from .config import EnvConfig, RewardConfig
-from .qiskit_runner import evaluate_layout_metrics, objective_from_metrics
+from .qiskit_runner import evaluate_layout_metrics, objective_from_metrics, prepare_basis_circuit
 from .topology import HardwareTopology
 
 
@@ -58,8 +58,9 @@ def sabre_layout(
     - We keep this as a lightweight heuristic baseline.
     - Full-strength SABRE comparisons should use the standalone/full baseline script.
     """
+    prepared = prepare_basis_circuit(circuit)
     transpiled = transpile(
-        circuit,
+        prepared,
         coupling_map=hardware.coupling_map,
         layout_method="sabre",
         routing_method="sabre",
@@ -69,16 +70,16 @@ def sabre_layout(
     )
 
     init_layout = transpiled.layout.initial_layout
-    mapping = [-1] * circuit.num_qubits
+    mapping = [-1] * prepared.num_qubits
 
     for virt, phys in init_layout.get_virtual_bits().items():
         try:
-            logical_idx = circuit.find_bit(virt).index
+            logical_idx = prepared.find_bit(virt).index
         except Exception:
             # Ancilla / extra virtual bits may not belong to the original circuit.
             continue
 
-        if 0 <= logical_idx < circuit.num_qubits:
+        if 0 <= logical_idx < prepared.num_qubits:
             mapping[logical_idx] = int(phys)
 
     free = [p for p in range(hardware.num_qubits) if p not in mapping]
@@ -110,12 +111,13 @@ def best_of_random(
 
     reward_cfg = reward_cfg or RewardConfig()
     rng = random.Random(seed)
+    prepared = prepare_basis_circuit(circuit, env_cfg)
 
     best_layout = None
     best_metric = float("inf")
 
     for _ in range(int(trials)):
-        layout = random_layout(circuit.num_qubits, hardware.num_qubits, rng)
+        layout = random_layout(prepared.num_qubits, hardware.num_qubits, rng)
         metrics = evaluate_layout_metrics(circuit, layout, hardware, env_cfg)
         metric = objective_from_metrics(metrics, reward_cfg, env_cfg)
         if metric < best_metric:
@@ -148,7 +150,7 @@ def teacher_layouts(
         )
 
     result = {
-        "trivial": trivial_layout(circuit.num_qubits),
+        "trivial": trivial_layout(logic.num_qubits),
         "dense": dense_layout(logic, hardware),
         "random_best": best_of_random(
             circuit,

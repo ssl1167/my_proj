@@ -116,7 +116,7 @@ def make_env(args: argparse.Namespace) -> InitialLayoutEnv:
 
 def build_model_from_env(env: InitialLayoutEnv, sample, hidden_dim: int, graph_layers: int, dropout: float,
                          physical_prior_scale: float, physical_prior_clip: float, device: torch.device):
-# 注入并同步基线缓存
+    # Populate the per-sample baseline cache before inferring observation sizes.
     if sample._cached_baseline is None:
         obs = env.reset(sample.to_circuit(), logic_graph=sample.get_logic_graph(env.env_cfg))
         sample._cached_baseline = (env.baseline_score, env.baseline_name, env.baseline_metrics)
@@ -144,7 +144,7 @@ def build_model_from_env(env: InitialLayoutEnv, sample, hidden_dim: int, graph_l
 
 @torch.no_grad()
 def run_eval_episode(model: GraphAwarePolicy, env: InitialLayoutEnv, sample, device: torch.device):
-    # 确保基线已计算，并传入
+    # Reuse the cached baseline so evaluation measures only the policy layout.
     if sample._cached_baseline is None:
         obs = env.reset(sample.to_circuit(), is_training=False, logic_graph=sample.get_logic_graph(env.env_cfg))
         sample._cached_baseline = (env.baseline_score, env.baseline_name, env.baseline_metrics)
@@ -191,7 +191,6 @@ def choose_eval_subset(samples: Sequence, eval_episodes: int, rng: np.random.Gen
 @torch.no_grad()
 def evaluate_policy(model: GraphAwarePolicy, env: InitialLayoutEnv, samples: Sequence, device: torch.device) -> Dict[str, Optional[float]]:
     model.eval()
-    # 原代码是 sample.to_circuit()，现改为直接传 sample
     rows = [run_eval_episode(model, env, sample, device) for sample in samples]
     model.train()
     return aggregate_eval_rows(rows)
@@ -259,7 +258,8 @@ def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
 
 def maybe_apply_stage_overrides(args: argparse.Namespace, env: InitialLayoutEnv, model: GraphAwarePolicy,
                                 ppo_cfg: PPOConfig, optimizer: torch.optim.Optimizer,
-                                stage_qubits: int, is_last_stage: bool) -> Dict[str, float | int | bool]:
+                                stage_qubits: int, is_last_stage: bool,
+                                num_stages: int) -> Dict[str, float | int | bool]:
     if stage_qubits < args.late_stage_start_qubits:
         return {
             "stage_physical_prior_scale": float(model.cfg.physical_prior_scale),
@@ -272,7 +272,7 @@ def maybe_apply_stage_overrides(args: argparse.Namespace, env: InitialLayoutEnv,
         ppo_cfg.entropy_coef = float(args.late_stage_entropy_coef)
     if args.late_stage_lr is not None:
         set_optimizer_lr(optimizer, float(args.late_stage_lr))
-    elif is_last_stage and args.final_stage_lr_decay > 0:
+    elif num_stages > 1 and is_last_stage and args.final_stage_lr_decay > 0:
         set_optimizer_lr(optimizer, args.lr * args.final_stage_lr_decay)
 
     return {
@@ -357,13 +357,22 @@ def run_training(args: argparse.Namespace) -> None:
 
         is_second_last = stage_idx == len(curriculum) - 2
         is_last = stage_idx == len(curriculum) - 1
-        if stage_qubits < args.late_stage_start_qubits:
+        if len(curriculum) > 1 and stage_qubits < args.late_stage_start_qubits:
             if is_second_last:
                 set_optimizer_lr(optimizer, args.lr * args.stage_lr_decay)
             elif is_last:
                 set_optimizer_lr(optimizer, args.lr * args.final_stage_lr_decay)
 
-        stage_override_info = maybe_apply_stage_overrides(args, env, model, ppo_cfg, optimizer, stage_qubits, is_last_stage=is_last)
+        stage_override_info = maybe_apply_stage_overrides(
+            args,
+            env,
+            model,
+            ppo_cfg,
+            optimizer,
+            stage_qubits,
+            is_last_stage=is_last,
+            num_stages=len(curriculum),
+        )
         effective_epochs = args.epochs_per_stage
         if args.late_stage_epochs_per_stage > 0 and stage_qubits >= args.late_stage_start_qubits:
             effective_epochs = args.late_stage_epochs_per_stage
@@ -386,7 +395,7 @@ def run_training(args: argparse.Namespace) -> None:
             iterator = stage_episode_iterator(stage_train, args.episodes_per_epoch, args.family_balance_mode, stage_rng)
             pbar = tqdm(iterator, total=args.episodes_per_epoch, desc=f"stage={stage_qubits} epoch={epoch}")
             for sample in pbar:
-                # --- 核心修改 4：在最核心、调用频次最高的循环里，挂载 O(1) 复杂度的缓存图 ---
+                # Cache baseline routing once per sample; it dominates episode runtime.
                 if sample._cached_baseline is None:
                     obs = env.reset(sample.to_circuit(), is_training=True, logic_graph=sample.get_logic_graph(env.env_cfg))
                     sample._cached_baseline = (env.baseline_score, env.baseline_name, env.baseline_metrics)
@@ -514,8 +523,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--value_clip", type=float, default=0.2)
 
-    p.add_argument("--stage_lr_decay", type=float, default=0.5)
-    p.add_argument("--final_stage_lr_decay", type=float, default=0.25)
+    p.add_argument("--stage_lr_decay", type=float, default=0.75)
+    p.add_argument("--final_stage_lr_decay", type=float, default=0.5)
     p.add_argument("--late_stage_start_qubits", type=int, default=32)
     p.add_argument("--late_stage_lr", type=float, default=None)
     p.add_argument("--late_stage_entropy_coef", type=float, default=None)
@@ -525,7 +534,6 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--cpu", action="store_true")
 
     p.add_argument("--logic_order_mode", type=str, default="priority_fixed", choices=["priority_fixed", "front_first", "index"])
-    # 增加 sabre 到 choices
     p.add_argument("--baseline_mode", type=str, default="dense", choices=["none", "trivial", "dense", "sabre"])
     p.add_argument("--router_backend", type=str, default="qiskit", choices=["qiskit", "tket"])
     return p
